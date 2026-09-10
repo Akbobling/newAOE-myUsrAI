@@ -29,10 +29,11 @@ vector<buildTask> buildTasks;
 map<int, int> farmerTask;
 int builderSN = -1;
 int totalMeat = 200;
-int lastkillX = -1, lastkillY = -1;
+double lastkillX = -1, lastkillY = -1;
 int granaryX = -1, granaryY = -1;
 int nearestResourceX, nearestResourceY;
 int needStock = 0;
+int marketSN = -1;
 bool isUpdatingStage = false;
 
 int huntingPhase = 0;
@@ -106,6 +107,7 @@ void UsrAI::init()
     }
 
     int stockNum = 0;
+    int fNum = 0;
     for(auto& building: info.buildings) {
         if(building.Type == BUILDING_GRANARY) {
             granaryX = building.BlockDR;
@@ -132,6 +134,9 @@ void UsrAI::init()
             homeX = building.BlockDR;
             homeY = building.BlockUR;
         }
+        if(building.Type == BUILDING_MARKET) {
+            marketSN = building.SN;
+        }
     }
 
     if(stockNum >= 2) stockBuilt = 1;
@@ -141,6 +146,7 @@ void UsrAI::init()
         for (int j = 0; j < MAP_SIZE; j++) {
             gameMap[i][j] = 0;
             exploreValueMap[i][j] = 0;
+            treeCoverMap[i][j] = 0;
             if (info.theMap != nullptr) {
                 const tagTerrain& terrain = (*info.theMap)[i][j];
                 int height = terrain.height;
@@ -334,7 +340,7 @@ void UsrAI::priest()
             }
             nextX = target.first;
             nextY = target.second;
-            DebugText("target.first = " + to_string(target.first) + ", target.second = " + to_string(target.second) + "map[" + to_string(target.first) + "][" + to_string(target.second) + "]" + to_string(gameMap[target.first][target.second]));
+            DebugText("priest to X = " + to_string(target.first) + ", priest to Y = " + to_string(target.second) + "map[" + to_string(target.first) + "][" + to_string(target.second) + "]" + to_string(gameMap[target.first][target.second]));
             HumanMove(priestSN, target.first * BLOCKSIDELENGTH, target.second * BLOCKSIDELENGTH);
         }
         lastOrderX = nextX;
@@ -410,7 +416,6 @@ pair<int,int> UsrAI::legalPlaceAround(int buildingType, int cx, int cy)
     DebugText("buildingType = " + to_string(buildingType));
     int size = getBuildingSideLen(buildingType);
     for (int radius = 0; radius <= 8 ; ++radius) {
-        DebugText("radius = " + to_string(radius));
         for (int dx = -radius; dx <= radius; ++dx) {
             for (int dy = -radius; dy <= radius; ++dy) {
                 int nx = cx + dx;
@@ -421,8 +426,6 @@ pair<int,int> UsrAI::legalPlaceAround(int buildingType, int cx, int cy)
                         for(int j=0;j<size;j++) {
                             if(gameMap[nx+i][ny+j] != 0) {
                                 isLegal = false;
-                                DebugText("nx = " + to_string(nx) + ", ny = " + to_string(ny));
-                                DebugText("map[" + to_string(nx+i) + "][" + to_string(ny+j) + "] = " + to_string(gameMap[nx+i][ny+j]));
                                 break;
                             }
                         }
@@ -474,20 +477,24 @@ void UsrAI::assignBuilding()
     if(!buildTasks.empty() && builder.NowState == 0) {
         auto task = buildTasks.front();
         if(checkResource(task.Type)) {
-            pair<int,int> target = legalPlaceAround(task.Type, task.BlockDR, task.BlockUR);
-            if(target.first == -1) {
-                DebugText("No legal place for targetbuilding");
-                return;
+            if(task.BlockDR > MAP_SIZE) {
+                BuildingAction(task.BlockDR, task.Type); //BUILDING_MARKET_WOOD_UPGRADE
+            } else {
+                pair<int,int> target = legalPlaceAround(task.Type, task.BlockDR, task.BlockUR);
+                if(target.first == -1) {
+                    DebugText("No legal place for target building");
+                    return;
+                }
+                lastOrderId = HumanBuild(builder.SN, task.Type, target.first, target.second);
+                lastTarget = target;
             }
-            lastOrderId = HumanBuild(builder.SN, task.Type, target.first, target.second);
-            lastTarget = target;
         }
     }
 }
 
 double UsrAI::euclidean_distance(double x1, double y1, double x2, double y2)
 {
-    return sqrt(abs(x1 - x2) * (x1 - x2) + abs(y1 - y2) * (y1 - y2));
+    return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
 }
 
 int UsrAI::manhattan_distance(int x1, int y1, int x2, int y2)
@@ -608,8 +615,6 @@ int UsrAI::getNearestResource(int resourceType, int cx, int cy, int deadoraliveO
         if(resource.SN == pq.top().second) {
             nearestResourceX = resource.DR;
             nearestResourceY = resource.UR;
-            DebugText("nearestResourceX = " + to_string(nearestResourceX));
-            DebugText("nearestResourceY = " + to_string(nearestResourceY));
             return pq.top().second;
         }
     }
@@ -640,9 +645,6 @@ void UsrAI::collecting()
             }
             if(nextResSN == -1) return;
             for(auto& farmer : info.farmers) {
-                DebugText("farmer.SN = " + to_string(farmer.SN));
-                DebugText("farmer.NowState = " + to_string(farmer.NowState));
-                DebugText("farmerState[" + to_string(farmer.SN) + "] = " + to_string(farmerState[farmer.SN]));
                 if(farmer.SN == builderSN) continue;
                 if(farmer.NowState == 0 && farmerState.count(farmer.SN) != 0 && farmerState[farmer.SN] == 0 
                     || farmer.NowState == 1 && farmerState.count(farmer.SN) != 0 && farmerState[farmer.SN] == 1) {
@@ -681,6 +683,8 @@ void UsrAI::collecting()
             }
             stockX /= deadMeatResources.size();
             stockY /= deadMeatResources.size();
+            DebugText("stockX = " + to_string(stockX));
+            DebugText("stockY = " + to_string(stockY));
             buildTasks.push_back({BUILDING_STOCK, stockX, stockY, {sns}});
             buildTasks.push_back({BUILDING_ARROWTOWER, centerX, centerY, {}});
             buildingScheduled = 1;
@@ -692,7 +696,6 @@ void UsrAI::collecting()
         for(auto& farmer: info.farmers) {
             if(farmer.SN != builderSN) {
                 farmerTask[farmer.SN] = deadMeatResources[i];
-                currentFarmersSN.insert(farmer.SN);
                 HumanAction(farmer.SN, deadMeatResources[i]); 
                 i++;
                 if(i >= deadMeatResources.size()) i = 0;
@@ -705,25 +708,39 @@ void UsrAI::collecting()
 void UsrAI::hunting()
 {
     tagResource nearestGazelle;
-    if(nearestGazelleSN == -1) {
+    if(nearestGazelleSN == -1) {//旧猎物死亡，需要指定新的猎物
         nearestGazelleSN = getNearestResource(RESOURCE_GAZELLE, centerX, centerY, 0);
     }
 
-    // 先确认猎物仍在视野内，避免读取未初始化的 nearestGazelle
-    bool insight = false;
-    for(auto& resource : info.resources) {
-        if(resource.SN == nearestGazelleSN) {
-            nearestGazelle = resource;
-            insight = true;
-            break;
+    // 如果猎物还未死亡，初始化 nearestGazelle
+    if(nearestGazelleSN != -1) {
+        bool insight = false;
+        for(auto& resource : info.resources) { 
+            if(resource.SN == nearestGazelleSN) {
+                nearestGazelle = resource;
+                insight = true;
+                break;
+            }
         }
+        if(!insight) return; //如果目标不在视野，等待重新进入视野
     }
 
-    if(!insight) return;
-
+    /*
+    DebugText("GazelleSN = " + to_string(nearestGazelleSN));
+    DebugText("GazelleBlood = " + to_string(nearestGazelle.Blood));
+    DebugText("GazelleDR = " + to_string(nearestGazelle.DR));
+    DebugText("GazelleUR = " + to_string(nearestGazelle.UR));
+    DebugText("lastkillX = " + to_string(lastkillX));
+    DebugText("lastkillY = " + to_string(lastkillY));
+    DebugText("distance = " + to_string(euclidean_distance(nearestGazelle.DR, nearestGazelle.UR, lastkillX, lastkillY)));
+    */
+    
+    //收集阶段切换逻辑：
+    //首先需要击杀数量达到农民数一半
+    //其次旧猎物死亡且视野内没有其它活猎物，或最近目标距离过远
     if(deadMeatResources.size() > info.farmers.size() / 2 &&
         (nearestGazelleSN == -1 || euclidean_distance(nearestGazelle.DR, nearestGazelle.UR, lastkillX, lastkillY) > 8 * BLOCKSIDELENGTH)) {
-        huntingPhase = 1;
+        huntingPhase = 1; //切换到收集阶段
         return;
     }
     
@@ -738,7 +755,6 @@ void UsrAI::hunting()
     }
 
     if(nearestGazelle.Blood <= 0) {
-        DebugText("dead: " + to_string(nearestGazelleSN));
         deadMeatResources.push_back(nearestGazelleSN);
         stockX += nearestGazelle.BlockDR;
         stockY += nearestGazelle.BlockUR;
@@ -751,79 +767,96 @@ void UsrAI::hunting()
 
 void UsrAI::logging() {
     static priority_queue<pair<int,int>, vector<pair<int,int>>, greater<pair<int,int>>> candTreeSNs;
+    static map<int,int> farmerState;
+    static int lastOrderFrame = -1;
     const double INF = 1e9;
+    const int orderInterval = 50;
     if(candTreeSNs.empty()) {
         for(auto& resource : info.resources) {
-            if(resource.BlockDR < 0 || resource.BlockDR >= MAP_SIZE || resource.BlockUR < 0 || resource.BlockUR >= MAP_SIZE) continue;
-            bool isSingle = treeCoverMap[resource.BlockDR][resource.BlockUR] > 0 && treeCoverMap[resource.BlockDR][resource.BlockUR] <= 1;
+            bool isSingle = treeCoverMap[resource.BlockDR][resource.BlockUR] <= 1;
+            if(resource.Type == RESOURCE_TREE) {
+                DebugText("X = " + to_string(resource.BlockDR) + ", Y = " + to_string(resource.BlockUR));
+                DebugText("isSingle = " + to_string(isSingle));
+            }
             if(resource.Type == RESOURCE_TREE && isSingle) {
-                double minDistance = INF;
+                int minDistance = INF;
                 for(auto& building : info.buildings) {
                     if(building.Type == BUILDING_CENTER || building.Type == BUILDING_STOCK) {
-                        minDistance = min(minDistance, euclidean_distance(building.BlockDR * BLOCKSIDELENGTH, building.BlockUR * BLOCKSIDELENGTH, resource.DR, resource.UR));
+                        minDistance = min(minDistance, manhattan_distance(building.BlockDR, building.BlockUR, resource.BlockDR, resource.BlockUR));
                     }
                 }
                 if(minDistance != INF) {
                     candTreeSNs.push(make_pair(minDistance, resource.SN));
                 }
+                if(resource.BlockDR >= 25 && resource.BlockUR <= 27 && resource.BlockUR >= 77 && resource.BlockUR <= 79) {
+                    DebugText("minDistance = " + to_string(minDistance));
+                }
             }
         }
-        // 队列仍为空（视野内无树）：直接返回，禁止对空队列 top()/pop()
         if(candTreeSNs.empty()) return;
         for(auto& farmer : info.farmers) {
             if(candTreeSNs.empty()) break;   // 树少于农民数时停止，防止越界
             if(farmer.SN != builderSN) {
+                farmerState[farmer.SN] = HUMAN_STATE_WORKING;
                 HumanAction(farmer.SN, candTreeSNs.top().second);
                 candTreeSNs.pop();
             }
         }
     }
 
+    if(info.GameFrame - lastOrderFrame <= orderInterval) return;
+    lastOrderFrame = info.GameFrame;
+
     for(auto& farmer : info.farmers) {
         if(candTreeSNs.empty()) break;       // 候选耗尽不再 pop
-        if(farmer.NowState == HUMAN_STATE_IDLE) {
+        if(farmer.SN == builderSN) continue;
+        if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end() || farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE) {
+            DebugText("farmer" + to_string(farmer.SN)+" now is idle, assigning tree...");
+            currentFarmersSN.insert(farmer.SN);
             HumanAction(farmer.SN, candTreeSNs.top().second);
             candTreeSNs.pop();
         }
+        farmerState[farmer.SN] = farmer.NowState;
     }
 
 }
 
 void UsrAI::gamePhase1() {
-    static int constructionPhase = 0;
-    assignArmy();
+    static bool buildingScheduled = false;
     if(info.Meat < 800){
         if(huntingPhase == 0) 
             hunting();
         else
             collecting();
     } else {
-        DebugText("[phase1] Meat>=800 进入建造阶段, frame=" + to_string(info.GameFrame));
-        if(!constructionPhase) {
+        if(!buildingScheduled) {
+            buildTasks.push_back({BUILDING_ARMYCAMP, arrowTowerX, arrowTowerY, {}});
             buildTasks.push_back({BUILDING_MARKET, arrowTowerX, arrowTowerY, {}});
             buildTasks.push_back({BUILDING_STABLE, arrowTowerX, arrowTowerY, {}});
-            constructionPhase = 1;
-            DebugText("[phase1] 已排队 market+stable, arrowTowerX=" + to_string(arrowTowerX) + " Y=" + to_string(arrowTowerY));
+            buildTasks.push_back({BUILDING_RANGE, arrowTowerX, arrowTowerY, {}});
+            buildTasks.push_back({BUILDING_COLLAGE, arrowTowerX, arrowTowerY, {}});
+            //buildTasks.push_back({BUILDING_MARKET_GOLD_UPGRADE, marketSN, marketSN, {}});
+            buildingScheduled = true;
         }
-        DebugText("[phase1] 调用 logging() 前");
+        assignArmy();
         logging();
-        DebugText("[phase1] 调用 updateStage() 前");
         updateStage();
-        DebugText("[phase1] updateStage() 完成");
     }
 }
 
 
 void UsrAI::farming() {
     const int FARM_SLOTS = 8;   // farmDx/farmDy 数组长度
-    if(info.Wood < BUILD_FARM_WOOD) return;
-    if(farmNum >= FARM_SLOTS) return;   // 预设点用尽，防止 farmDx[farmNum] 越界
+    if(info.Wood < BUILD_FARM_WOOD || farmNum >= FARM_SLOTS) return;
+
     pair<int,int> nextFarmPosition;
+
     int nextFarmX, nextFarmY;
     nextFarmPosition = legalPlaceAround(BUILDING_FARM, granaryX + farmDx[farmNum], granaryY + farmDy[farmNum]);
     nextFarmX = nextFarmPosition.first;
     nextFarmY = nextFarmPosition.second;
     if(nextFarmX == -1) return;   // 该预设点附近无合法地块，等下帧/木材变化后重试
+
     for(auto& farmer: info.farmers) {
         if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end()) {
             currentFarmersSN.insert(farmer.SN);
@@ -832,21 +865,18 @@ void UsrAI::farming() {
             farmNum++;
             break;
         }
-        if(farmer.NowState == HUMAN_STATE_IDLE) {
-            farmerTask[farmer.SN] = BUILDING_FARM;
-            HumanBuild(farmer.SN, BUILDING_FARM, nextFarmX, nextFarmY);
-            farmNum++;
-            break;
-        }
     }
-    if(farmNum >= FARM_SLOTS) return;
+
+    if(info.Wood < BUILD_FARM_WOOD || farmNum >= FARM_SLOTS) return;
     nextFarmPosition = legalPlaceAround(BUILDING_FARM, granaryX + farmDx[farmNum], granaryY + farmDy[farmNum]);
     nextFarmX = nextFarmPosition.first;
     nextFarmY = nextFarmPosition.second;
     if(nextFarmX == -1) return;
+
     for(auto& farmer: info.farmers) {
-        if(farmer.SN != builderSN && farmerTask[farmer.SN] != BUILDING_FARM) {
+        if(farmer.SN != builderSN && farmerTask[farmer.SN] != 2) { //1表示logging 2表示farming
             HumanBuild(farmer.SN, BUILDING_FARM, nextFarmX, nextFarmY);
+            farmerTask[farmer.SN] = 2;
             farmNum++;
             break;
         }
@@ -861,14 +891,15 @@ void UsrAI::goldMining() {
         bestCluster = findBestGoldCluster();
         if(bestCluster.sns.empty()) return;
         buildTasks.push_back({BUILDING_STOCK, bestCluster.centerX, bestCluster.centerY, {} });
-        for(auto& farmer: info.farmers) {
-            if(farmerTask[farmer.SN] != BUILDING_FARM) {
-                farmerTask[farmer.SN] = bestCluster.sns[curIndex];  
-                HumanAction(farmer.SN, bestCluster.sns[curIndex++]);
-                if(curIndex >= bestCluster.sns.size()) curIndex = 0;
-            }
-        }
         first = 0;
+    }
+    for(auto& farmer: info.farmers) {
+        if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end()) {
+            currentFarmersSN.insert(farmer.SN);
+            farmerTask[farmer.SN] = 3; // 3表示mining
+            HumanAction(farmer.SN, bestCluster.sns[curIndex++]);
+            if(curIndex >= bestCluster.sns.size()) curIndex = 0;
+        }
     }
 }
 
@@ -902,20 +933,37 @@ void UsrAI::Defense() {
 }
 
 void UsrAI::gamePhase2() {
-    static int collageBuildingPhase = 1;
+    static int collageBuilt = 1;
     static int farmBuildingPhase = 1;
-    const int maxFarmNum = 10;
-    if(collageBuildingPhase && info.Wood >= BUILD_COLLAGE_WOOD){
-        buildTasks.push_back({BUILDING_COLLAGE, arrowTowerX, arrowTowerY, {}});
-        collageBuildingPhase = 0;
-    } else if(farmBuildingPhase && farmNum < maxFarmNum){
+    static int farmerInitialised = 0;
+    static int miningPhase = 0;
+    const int maxFarmNum = 8;
+
+    if(!farmerInitialised) {
+        for(auto& farmer: info.farmers) {
+            currentFarmersSN.insert(farmer.SN);
+            if(farmer.SN != builderSN) {
+                farmerTask[farmer.SN] = 1; // 1表示logging 2表示farming
+            }
+        }
+        farmerInitialised = 1;
+    }
+        
+    if(farmBuildingPhase){
         farming();
-    } else {
-        farmBuildingPhase = 0;
+        if(farmNum >= maxFarmNum) 
+            farmBuildingPhase = 0;
+    } else if(miningPhase || buildTasks.empty()){
         goldMining();
         createArmy1();
         Defense();
+        if(!miningPhase) {
+            buildTasks.push_back({BUILDING_MARKET_GOLD_UPGRADE, marketSN, marketSN, {}});
+            miningPhase = 1;
+        }
     }
+
+    logging();
 }
 
 bool UsrAI::checkArmy1() {
@@ -1006,22 +1054,47 @@ bool UsrAI::checkResource(int buildingType)
 
 void UsrAI::arrowTowerAttack(int towerSN, int BlockDR, int BlockUR)
 {
-    static map<int, set<int> > arrowTowerEnemy;
+    //DebugText("current towerSN = " + to_string(towerSN));
+    static map<int, bool > haveAttacked;
+    static map<int, int > lastAttackFrame;
     const int attackRange = 7;
+    const int attackInterval = 60;
 
-    if(arrowTowerEnemy.find(towerSN) == arrowTowerEnemy.end()) {
-        arrowTowerEnemy[towerSN] = set<int>();
+    if(info.GameFrame - lastAttackFrame[towerSN] < attackInterval) return;
+    lastAttackFrame[towerSN] = info.GameFrame;
+
+    set<int> candEnemySNs;
+    int nextEnemySN = -1;
+
+    for(auto& enemy: info.enemy_armies) { //加入新敌人
+        if(manhattan_distance(BlockDR, BlockUR, enemy.BlockDR, enemy.BlockUR) > attackRange) continue;
+        candEnemySNs.insert(enemy.SN);
     }
 
-    for(auto& enemy: info.enemy_armies) {
-        if(arrowTowerEnemy[towerSN].find(enemy.SN) != arrowTowerEnemy[towerSN].end()) {
-            arrowTowerEnemy[towerSN].insert(enemy.SN);
-            HumanAction(towerSN, enemy.SN);
+    for(auto& enemySN: candEnemySNs) { //优先攻击新敌人
+        if(haveAttacked.count(enemySN) == 0) {
+            haveAttacked[enemySN] = false;
+        }
+        if(!haveAttacked[enemySN]) {
+            haveAttacked[enemySN] = true;
+            DebugText("tower " + to_string(enemySN)+" is attacking enemy " + to_string(enemySN));
+            nextEnemySN = enemySN;
+            break;
+        }
+    }
+    
+    if(nextEnemySN != -1) {
+        double maxAtkHpRatio = 0;
+        for(auto& enemy: info.enemy_armies) { //找出当前攻血比最高的敌人
+            if(candEnemySNs.find(enemy.SN) == candEnemySNs.end() || enemy.Blood <= 0) continue;
+            if((double)enemy.attack / enemy.Blood > maxAtkHpRatio) {
+                maxAtkHpRatio = (double)enemy.attack / enemy.Blood;
+                nextEnemySN = enemy.SN;
+            }
         }
     }
 
-    
-    
+    HumanAction(towerSN, nextEnemySN);
 }
 
 void UsrAI::assignArmy()
@@ -1045,3 +1118,5 @@ void UsrAI::processData()
     
     createFarmer();
 }
+
+//farming()未触发
