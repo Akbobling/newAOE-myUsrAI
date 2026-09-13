@@ -8,6 +8,13 @@ extern tagGame tagUsrGame;
 extern ins UsrIns;
 /*##########DO NOT MODIFY THE CODE ABOVE##########*/
 
+struct buildTask {
+    int Type;   // 建筑类型
+    int BlockDR;       // 当前尝试点（左上角块坐标 DR）
+    int BlockUR;       // 当前尝试点（左上角块坐标 UR）
+    vector<int> builderSNs;   // 建筑工 SN 列表
+};
+
 struct GoldCluster {
     int centerX;       // 簇质心（块坐标）
     int centerY;
@@ -22,25 +29,21 @@ public:
 
 private:
     void processData() override;
-    tagInfo getInfo(){return tagUsrGame.getInfo();}
     int AddToIns(instruction ins) override
-    {
-        UsrIns.lock.lock();
-        ins.id=UsrIns.g_id;
-        UsrIns.g_id++;
-        UsrIns.instructions.push(ins);
-        UsrIns.lock.unlock();
-        return ins.id;
-    }
+        {
+            UsrIns.lock.lock();
+            ins.id=UsrIns.g_id;
+            UsrIns.g_id++;
+            UsrIns.instructions.push(ins);
+            UsrIns.lock.unlock();
+            return ins.id;
+        }
+    tagInfo getInfo(){return tagUsrGame.getInfo();}
     void clearInsRet() override
     {
         tagUsrGame.clearInsRet();
     }
     /*##########DO NOT MODIFY THE CODE IN THE CLASS##########*/
-    void collectResource();
-    void arrowTowerAttack(int towerSN, int BlockDR, int BlockUR);
-    void getLegalPlace(tagObj, int, int);
-    /*##########YOUR CODE BEGINS HERE##########*/
     int getBuildingSideLen(int type);
     int getResourceSideLen(int type);
     void init();
@@ -54,13 +57,16 @@ private:
     double euclidean_distance(double x1, double y1, double x2, double y2);
     int manhattan_distance(int x1, int y1, int x2, int y2);
     int getNearestResource(int resourceType, int cx, int cy, int aliveOnly);
+    int getAttackRange(int armyType);
     GoldCluster findBestGoldCluster();
     void assignFarmer();
     int getBuildingRequiredAge(int buildingType);
     int getBuildingWoodCost(int buildingType);
     int getBuildingStoneCost(int buildingType);
+    void arrowTowerAttack(int towerSN, int BlockDR, int BlockUR);
     bool checkResource(int buildingType);
     bool checkRequiredBuilding();
+    void fixingArrowTower();
     void hunting();
     void collecting();
     void assignArmy();
@@ -68,36 +74,16 @@ private:
     void logging();
     void farming();
     void goldMining();
+    void berryCollecting();
+    void stoneMining();
+    void resourceSwitch();
+    void repairRepurpose();
     void createArmy1();
     bool checkArmy1();
     void Defense();
     void gamePhase1();
     void gamePhase2();
     void gamePhase3();
-    /*##########YOUR CODE ENDS HERE##########*/
-
-
 };
 
-struct buildTask {
-    int Type;   // 建筑类型
-    int BlockDR;       // 当前尝试点（左上角块坐标 DR）
-    int BlockUR;       // 当前尝试点（左上角块坐标 UR）
-    vector<int> builderSNs;   // 建筑工 SN 列表
-};
-
-/*##########YOUR CODE BEGINS HERE##########*/
-
-bool compareSN(tagObj, tagObj);
-bool compareDistance(tagObj, tagObj);
-bool compareBlood(tagHuman, tagHuman);
-double getDistance(tagObj, tagObj);
-void getResource();
-void getOccupied();
-tagBuilding getLastBuilding(int);
-void occupied(tagObj, int);
-
-
-
-/*##########YOUR CODE ENDS HERE##########*/
-#endif // USRAI_H
+#endif

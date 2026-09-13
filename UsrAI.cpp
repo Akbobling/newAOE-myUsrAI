@@ -24,9 +24,11 @@ int dx[4] = {5,0,-5,0},
 int cDir = 0, cMX = 60, cMY = 60;
 int gameMap[MAP_SIZE+1][MAP_SIZE+1];
 int exploreValueMap[MAP_SIZE+1][MAP_SIZE+1];
+int enemyAtkRangeMap[MAP_SIZE+1][MAP_SIZE+1];
 int treeCoverMap[MAP_SIZE+1][MAP_SIZE+1];
 vector<buildTask> buildTasks;
 map<int, int> farmerTask;
+map<int, int> farmerState;
 int builderSN = -1;
 int totalMeat = 200;
 double lastkillX = -1, lastkillY = -1;
@@ -35,6 +37,7 @@ int nearestResourceX, nearestResourceY;
 int needStock = 0;
 int marketSN = -1;
 bool isUpdatingStage = false;
+bool needFixArrowTower = false;
 
 int huntingPhase = 0;
 int nearestGazelleSN = -1;
@@ -50,6 +53,18 @@ int farmDy[8] = {-4, 4, -3, 0, 3, -4, 0, 3};
 vector<int> deadMeatResources;
 set<int> currentFarmersSN;
 set<int> arrowTowerSN;
+
+// ==== 浆果采集 / 资源动态切换状态 ====
+vector<int> berryResourceSNs;      // 开局记录的浆果资源 SN
+set<int> assignedBerrySNs;         // 已分配给村民的浆果 SN（一对一）
+map<int,int> berryAssignment;      // 村民SN -> 浆果SN
+set<int> hunterFarmersSN;          // 猎人（开局初始村民，狩猎羚羊）
+set<int> berryFarmersSN;           // 浆果采集村民（新生成村民）
+set<int> stoneFarmersSN;           // 采石村民
+set<int> repairFarmersSN;          // 箭塔维修村民（14000帧后从采石组二次分配而来）
+bool hunterInitialized = false;    // 猎人组是否已初始化
+bool resourceSwitchDone = false;   // 需求4：食物/人口达标后切采石+伐木
+bool repairRepurposeDone = false;  // 需求5：14000帧采石村民二次分配
 
 
 int UsrAI::getBuildingSideLen(int type) {
@@ -106,6 +121,17 @@ void UsrAI::init()
         }
     }
 
+    // 需求2/3：开局首次将所有现有村民（除 builder）初始化为猎人
+    // 之后新生成的村民由 berryCollecting() 认领为浆果采集者
+    if(!hunterInitialized) {
+        for(auto& farmer: info.farmers) {
+            if(farmer.SN != builderSN) {
+                hunterFarmersSN.insert(farmer.SN);
+            }
+        }
+        hunterInitialized = true;
+    }
+
     int stockNum = 0;
     int fNum = 0;
     for(auto& building: info.buildings) {
@@ -145,6 +171,7 @@ void UsrAI::init()
     for (int i = 0; i < MAP_SIZE; i++) {
         for (int j = 0; j < MAP_SIZE; j++) {
             gameMap[i][j] = 0;
+            enemyAtkRangeMap[i][j] = 0;
             exploreValueMap[i][j] = 0;
             treeCoverMap[i][j] = 0;
             if (info.theMap != nullptr) {
@@ -163,6 +190,14 @@ void UsrAI::init()
         }
     }
 
+    int gazelleNum = 0;
+
+    for(auto& resource: info.resources) {
+        if(resource.Type == RESOURCE_GAZELLE) {
+            gazelleNum ++;
+        }
+    }
+
     // 遍历所有资源并在map上标注为已占用
     for (int i = 0; i < info.resources.size(); i++) {
         int rx = info.resources[i].BlockDR;
@@ -174,7 +209,7 @@ void UsrAI::init()
                 int ny = ry + dy;
                 if (nx >= 0 && nx < MAP_SIZE && ny >= 0 && ny < MAP_SIZE) {
                     gameMap[nx][ny] = 1;
-                    if(info.resources[i].Type == RESOURCE_GAZELLE || info.resources[i].Type == RESOURCE_GOLD) {
+                    if(info.resources[i].Type == RESOURCE_GOLD) {
                         exploreValueMap[nx][ny] += 1;
                     }
                     if(info.resources[i].Type == RESOURCE_LION) {
@@ -184,13 +219,24 @@ void UsrAI::init()
                         treeCoverMap[nx][ny] += 1;
                         exploreValueMap[nx][ny] -= 2;
                     }
+                    if(info.resources[i].Type == RESOURCE_GAZELLE) {
+                        if(gazelleNum <= 3) {
+                            exploreValueMap[nx][ny] += 1;
+                        } else {
+                            exploreValueMap[nx][ny] -= 3;
+                        }
+                    }
                 }
             }
         }
     }
 
     // 遍历所有建筑并在map上标注为已占用
+    needFixArrowTower = false;
     for (int i = 0; i < info.buildings.size(); i++) {
+        if(info.buildings[i].Type == BUILDING_ARROWTOWER && info.buildings[i].Blood != info.buildings[i].MaxBlood) {
+            needFixArrowTower = true;
+        }
         int bx = info.buildings[i].BlockDR;
         int by = info.buildings[i].BlockUR;
         int size = getBuildingSideLen(info.buildings[i].Type);
@@ -205,12 +251,39 @@ void UsrAI::init()
         }
     }
     
+    for(auto& enemy: info.enemy_armies) {
+        for(int dx = -15; dx <= 15; dx++) {
+            for (int dy = -15; dy <= 15; dy++) {
+                int nx = enemy.BlockDR + dx;
+                int ny = enemy.BlockUR + dy;
+                if (nx >= 0 && nx < MAP_SIZE && ny >= 0 && ny < MAP_SIZE) {
+                    exploreValueMap[nx][ny] -= 5;
+                }
+            }
+        }
+        // 需求6：仅纳入正在进攻祭祀单位的敌人（WorkObjectSN == priestSN）
+        if(enemy.WorkObjectSN != priestSN) continue;
+        int atkRange = getAttackRange(enemy.Sort) + 2;
+        for(int dx = -atkRange; dx <= atkRange; dx++) {
+            for (int dy = -atkRange; dy <= atkRange; dy++) {
+                int nx = enemy.BlockDR + dx;
+                int ny = enemy.BlockUR + dy;
+                if (nx >= 0 && nx < MAP_SIZE && ny >= 0 && ny < MAP_SIZE) {
+                    enemyAtkRangeMap[nx][ny] = 1;
+                }
+            }
+        }
+    }
+    
     for (int i=0; i < info.farmers.size(); i++) {
         int fx = info.farmers[i].BlockDR;
         int fy = info.farmers[i].BlockUR;
         if (fx >= 0 && fx < MAP_SIZE && fy >= 0 && fy < MAP_SIZE) {
             gameMap[fx][fy] = 1;
         }
+    }
+    for(auto& army: info.armies) {
+        gameMap[army.BlockDR][army.BlockUR] = 1;
     }
 }
 
@@ -229,12 +302,27 @@ bool UsrAI::checkRequiredBuilding()
 
 void UsrAI::updateStage()
 {
+    static int lastOrderId = -1;
+    int lastOrderTime = 0;
+    if(info.GameFrame - lastOrderTime < 100) return;
+    lastOrderTime = info.GameFrame;
+
+    if(info.Meat < BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD) DebugText("Not enough meat to upgrade center");
+    if(!checkRequiredBuilding()) DebugText("Not enough required buildings to upgrade center");
     if(info.civilizationStage <= CIVILIZATION_TOOLAGE && info.Meat >= BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD && checkRequiredBuilding()) {
         for(auto& building : info.buildings) {
             if(building.Type == BUILDING_CENTER) {
-                BuildingAction(building.SN, BUILDING_CENTER_UPGRADE);
+                lastOrderId = BuildingAction(building.SN, BUILDING_CENTER_UPGRADE);
                 break;
             }
+        }
+    }
+
+    // 通过 ins_ret 获取升级铜器时代指令的状态码
+    if(lastOrderId != -1) {
+        auto it = info.ins_ret.find(lastOrderId);
+        if(it != info.ins_ret.end()) {
+            DebugText("BronzeAge upgrade ins_ret code = " + to_string(it->second));
         }
     }
 }
@@ -271,14 +359,14 @@ void UsrAI::createArmy()
 }
 
 // 兵种攻击距离（块）。近战统一按 1 算，远程按内核 DIS_xxx 配置
-int getAttackRange(int armyType)
+int UsrAI::getAttackRange(int armyType)
 {
     switch (armyType) {
-        case AT_BOWMAN:            return 5;    // 弓箭手
-        case AT_COMPOSITE_BOWMAN:  return 7;    // 复合弓兵
-        case AT_CHARIOT_ARCHER:    return 7;    // 战车弓兵
-        case AT_STONE_THROWER:     return 10;   // 投石车
-        case AT_SLINGER:           return 4;    // 投石兵
+        case AT_BOWMAN:            return 6;    // 弓箭手
+        case AT_COMPOSITE_BOWMAN:  return 8;    // 复合弓兵
+        case AT_CHARIOT_ARCHER:    return 8;    // 战车弓兵
+        case AT_STONE_THROWER:     return 11;   // 投石车
+        case AT_SLINGER:           return 5;    // 投石兵
         default:                   return 1;    // 棍棒兵/战斧兵/侦察骑兵/骑兵/四马战车/阔剑兵/方阵兵等近战
     }
 }
@@ -292,14 +380,18 @@ void UsrAI::priest()
     static int lastOrderFrame = - 10000;
     static int returned = 0;
     static vector<pair<int,int>> visitedPoints;
+    static bool converting = false;      // 需求7：是否正在转化敌方单位
+    static int convertTargetSN = -1;     // 当前转化目标 SN
+    static int lastPriestBlood = -1;     // 上帧祭祀血量，用于检测受攻击
     const int retryInterval = 50;
     const int radius = 5;
 
-    int priestX = -1, priestY = -1;
+    int priestX = -1, priestY = -1, priestBlood = -1;
     for(auto& army: info.armies) {
         if(army.Sort == AT_PRIEST) {
             priestX = army.BlockDR;
             priestY = army.BlockUR;
+            priestBlood = army.Blood;
             break;
         }
     }
@@ -307,42 +399,130 @@ void UsrAI::priest()
     //DebugText("lastOrderX = " + to_string(lastOrderX) + ", lastOrderY = " + to_string(lastOrderY));
     //DebugText("manhattan_distance = " + to_string(manhattan_distance(lastOrderX,lastOrderY,priestX,priestY)))
     if(info.GameFrame > 5500) {
+        // 需求7：转化保护——转化中且未受攻击(Blood未减少)时，暂停移动逻辑
+        if(converting) {
+            bool targetExists = false;
+            for(auto& enemy : info.enemy_armies) {
+                if(enemy.SN == convertTargetSN) { targetExists = true; break; }
+            }
+            if(targetExists && priestBlood != -1 && lastPriestBlood != -1 && priestBlood >= lastPriestBlood) {
+                return;  // 未受攻击且目标仍在：继续转化，不发移动指令
+            }
+            converting = false;  // 受到攻击或转化完成(目标消失)
+        }
+        lastPriestBlood = priestBlood;
+
         if(info.GameFrame - lastOrderFrame < retryInterval) {
             return;
         }
         int nextX = -1, nextY = -1;
-        bool ordered = false;
-        for(auto& enemy: info.enemy_armies) {
-            if(enemy.WorkObjectSN == priestSN && manhattan_distance(enemy.BlockDR,enemy.BlockUR,priestX,priestY) <= getAttackRange(enemy.Sort) + 1) {
-                int dirX = (priestX > enemy.BlockDR) ? 1 : (priestX < enemy.BlockDR ? -1 : 0);
-                int dirY = (priestY > enemy.BlockUR) ? 1 : (priestY < enemy.BlockUR ? -1 : 0);
-                int fleeX = priestX, fleeY = priestY;
-                for(int step = 1; step <= 15; step++) {
-                    int nx = priestX + dirX * step;
-                    int ny = priestY + dirY * step;
-                    if(nx < 0 || nx >= MAP_SIZE || ny < 0 || ny >= MAP_SIZE) break;
-                    if(gameMap[nx][ny] == 1) break; 
-                    fleeX = nx; 
-                    fleeY = ny;
+
+        if(enemyAtkRangeMap[priestX][priestY] == 1) {
+            const int TOWER_RANGE = 7;   // 与 arrowTowerAttack 的 attackRange 一致（切比雪夫距离）
+            bool handled = false;
+
+            // 需求：遇到攻击祭祀的远程兵种，沿箭塔攻击范围边缘撤退，直到敌人进入箭塔射程
+            // 1) 找最近的可用箭塔
+            int towerX = -1, towerY = -1, towerMinDist = INT_MAX;
+            for(auto& b : info.buildings) {
+                if(b.Type == BUILDING_ARROWTOWER && b.Blood >= 10) {
+                    int d = manhattan_distance(b.BlockDR, b.BlockUR, priestX, priestY);
+                    if(d < towerMinDist) { towerMinDist = d; towerX = b.BlockDR; towerY = b.BlockUR; }
                 }
-                nextX = fleeX;
-                nextY = fleeY;
-                HumanMove(priestSN, fleeX * BLOCKSIDELENGTH, fleeY * BLOCKSIDELENGTH);
-                ordered = true;
-                break;
+            }
+            // 2) 找攻击祭祀的远程兵种（远程即 getAttackRange > 1）
+            int enemyX = -1, enemyY = -1, enemyMinDist = INT_MAX;
+            for(auto& enemy : info.enemy_armies) {
+                if(enemy.WorkObjectSN == priestSN && getAttackRange(enemy.Sort) > 1) {
+                    int d = manhattan_distance(enemy.BlockDR, enemy.BlockUR, priestX, priestY);
+                    if(d < enemyMinDist) { enemyMinDist = d; enemyX = enemy.BlockDR; enemyY = enemy.BlockUR; }
+                }
+            }
+            if(towerX != -1 && enemyX != -1) {
+                bool enemyInTowerRange = (abs(enemyX - towerX) <= TOWER_RANGE && abs(enemyY - towerY) <= TOWER_RANGE);
+                if(!enemyInTowerRange) {
+                    // 3) 在箭塔射程边缘(切比雪夫==TOWER_RANGE)找合法点：离远程敌人最远、离祭祀尽量近
+                    int bestX = -1, bestY = -1;
+                    int bestToEnemy = -1;
+                    int bestToPriest = INT_MAX;
+                    for(int i = 0; i < MAP_SIZE; i++) {
+                        for(int j = 0; j < MAP_SIZE; j++) {
+                            int cheb = max(abs(i - towerX), abs(j - towerY));
+                            if(cheb != TOWER_RANGE || gameMap[i][j] != 0) continue;
+                            int de = abs(i - enemyX) + abs(j - enemyY);
+                            int dp = abs(i - priestX) + abs(j - priestY);
+                            if(de > bestToEnemy || (de == bestToEnemy && dp < bestToPriest)) {
+                                bestToEnemy = de;
+                                bestToPriest = dp;
+                                bestX = i; bestY = j;
+                            }
+                        }
+                    }
+                    if(bestX != -1) {
+                        nextX = bestX; nextY = bestY;
+                        HumanMove(priestSN, bestX * BLOCKSIDELENGTH, bestY * BLOCKSIDELENGTH);
+                        handled = true;
+                    }
+                }
+            }
+
+            if(!handled) {
+                int minDis = 10000;
+                for(int i = 0; i < MAP_SIZE; i++) {
+                    for(int j = 0; j < MAP_SIZE; j++) {
+                        if(enemyAtkRangeMap[i][j] == 0 && gameMap[i][j] == 0 && manhattan_distance(i,j,priestX,priestY) < minDis) {
+                            minDis = manhattan_distance(i,j,priestX,priestY);
+                            nextX = i;
+                            nextY = j;
+                        }
+                    }
+                }
+                HumanMove(priestSN, nextX * BLOCKSIDELENGTH, nextY * BLOCKSIDELENGTH);
+            }
+        } else {
+            // 需求7：不在任何仇恨敌人攻击范围内时，选择最近的敌方方阵兵进行转化
+            int targetSN = -1;
+            int minDist = INT_MAX;
+            for(auto& enemy : info.enemy_armies) {
+                if(enemy.Sort == AT_HOPLITE) {
+                    int d = manhattan_distance(enemy.BlockDR, enemy.BlockUR, priestX, priestY);
+                    if(d < minDist) { minDist = d; targetSN = enemy.SN; }
+                }
+            }
+            if(targetSN != -1) {
+                HumanAction(priestSN, targetSN);  // 转化（内核 ATTACKTYPE_CHANGE）
+                converting = true;
+                convertTargetSN = targetSN;
+                nextX = priestX;  // 未移动，占位避免 lastOrder 记录越界
+                nextY = priestY;
+            } else {
+                // 没有可转化方阵兵，退回原逻辑：移动到箭塔中心
+                int midX = 0, midY = 0;
+                int arrowTowerNum = 0;
+                for(auto& building: info.buildings) {
+                    if(building.Type == BUILDING_ARROWTOWER && building.Blood >= 10) {
+                        midX += building.BlockDR;
+                        midY += building.BlockUR;
+                        arrowTowerNum++;
+                    }
+                }
+                if(arrowTowerNum == 0) {
+                    DebugText("No arrow tower");
+                    return;
+                }
+                midX /= arrowTowerNum;
+                midY /= arrowTowerNum;
+                pair<int,int> target = legalPlaceAround(BUILDING_HOME, midX, midY);
+                if(target.first == -1) {
+                    DebugText("No legal place for priest");
+                    return;
+                }
+                nextX = target.first;
+                nextY = target.second;
+                HumanMove(priestSN, target.first * BLOCKSIDELENGTH, target.second * BLOCKSIDELENGTH);
             }
         }
-        if(!ordered) {
-            pair<int,int> target = legalPlaceAround(BUILDING_HOME, arrowTowerX, arrowTowerY);
-            if(target.first == -1) {
-                DebugText("No legal place for priest");
-                return;
-            }
-            nextX = target.first;
-            nextY = target.second;
-            DebugText("priest to X = " + to_string(target.first) + ", priest to Y = " + to_string(target.second) + "map[" + to_string(target.first) + "][" + to_string(target.second) + "]" + to_string(gameMap[target.first][target.second]));
-            HumanMove(priestSN, target.first * BLOCKSIDELENGTH, target.second * BLOCKSIDELENGTH);
-        }
+
         lastOrderX = nextX;
         lastOrderY = nextY;
         lastPriestX = priestX;
@@ -378,7 +558,7 @@ void UsrAI::priest()
     //DebugText("centerX = " + to_string(centerX) + ", centerY = " + to_string(centerY));
     for(int i=0;i<MAP_SIZE;i++) {
         for(int j=0;j<MAP_SIZE;j++) {
-            if(manhattan_distance(i,j,centerX,centerY) > 60 || gameMap[i][j] == -1 || gameMap[i][j] == 1) continue;
+            if(manhattan_distance(i,j,centerX,centerY) > 45 || gameMap[i][j] == -1 || gameMap[i][j] == 1) continue;
             int totalValue = 0;
             for (int dx = -radius; dx <= radius; ++dx) {
                 for (int dy = -(radius - abs(dx)); dy <= radius - abs(dx); ++dy) {
@@ -412,8 +592,8 @@ void UsrAI::priest()
 
 pair<int,int> UsrAI::legalPlaceAround(int buildingType, int cx, int cy)
 {
-    DebugText("cx = " + to_string(cx) + ", cy = " + to_string(cy));
-    DebugText("buildingType = " + to_string(buildingType));
+    //DebugText("cx = " + to_string(cx) + ", cy = " + to_string(cy));
+    //DebugText("buildingType = " + to_string(buildingType));
     int size = getBuildingSideLen(buildingType);
     for (int radius = 0; radius <= 8 ; ++radius) {
         for (int dx = -radius; dx <= radius; ++dx) {
@@ -422,8 +602,8 @@ pair<int,int> UsrAI::legalPlaceAround(int buildingType, int cx, int cy)
                 int ny = cy + dy;
                 if (nx >= 0 && nx + size <= MAP_SIZE && ny >= 0 && ny + size <= MAP_SIZE) {
                     int isLegal = true;
-                    for(int i=0;i<size && isLegal;i++) {
-                        for(int j=0;j<size;j++) {
+                    for(int i=-1;i<=size && isLegal;i++) {
+                        for(int j=-1;j<=size;j++) {
                             if(gameMap[nx+i][ny+j] != 0) {
                                 isLegal = false;
                                 break;
@@ -449,7 +629,7 @@ void UsrAI::assignBuilding()
         if(it != info.ins_ret.end() && it->second == ACTION_SUCCESS) {
             auto task = buildTasks.front();
             for(auto& building: info.buildings) {
-                if(building.BlockDR == lastTarget.first && building.BlockUR == lastTarget.second && building.Percent < 100) {
+                if(building.BlockDR == lastTarget.first && building.BlockUR == lastTarget.second) {
                     for(int& sn : task.builderSNs) {
                         HumanAction(sn, building.SN);
                     }
@@ -623,38 +803,30 @@ int UsrAI::getNearestResource(int resourceType, int cx, int cy, int deadoraliveO
 
 void UsrAI::collecting()
 {
-    static map<int,int> farmerState;
     static int lastUpdateFrame = -1;
-    static int bushHuntersNum = 0;
     static int buildingScheduled = 0;
-    const int maxBushHuntersNum = 2;
     if(deadMeatResources.empty()) {
         if(info.GameFrame - lastUpdateFrame > 25) {
-            int nextResSN = getNearestResource(RESOURCE_BUSH, centerX, centerY, -1);
-            if(nextResSN == -1) DebugText("No valid bush resource");
-            if(nextResSN == -1 || bushHuntersNum >= maxBushHuntersNum) {
-                int maxCnt = -1;
-                for(auto& resource : info.resources) {
-                    if(resource.Type == RESOURCE_GAZELLE && resource.Blood <= 0 && resource.Cnt > maxCnt) {
-                        DebugText("resource.SN = " + to_string(resource.SN));
-                        DebugText("resource.Cnt = " + to_string(resource.Cnt));
-                        maxCnt = resource.Cnt;
-                        nextResSN = resource.SN;
-                    }
+            int nextResSN;
+            int maxCnt = -1;
+            for(auto& resource : info.resources) {
+                if(resource.Type == RESOURCE_GAZELLE && resource.Blood <= 0 && resource.Cnt > maxCnt) {
+                    //DebugText("resource.SN = " + to_string(resource.SN));
+                    //DebugText("resource.Cnt = " + to_string(resource.Cnt));
+                    maxCnt = resource.Cnt;
+                    nextResSN = resource.SN;
                 }
             }
             if(nextResSN == -1) return;
             for(auto& farmer : info.farmers) {
-                if(farmer.SN == builderSN) continue;
+                if(hunterFarmersSN.count(farmer.SN) == 0) continue;  // 只派猎人收肉
                 if(farmer.NowState == 0 && farmerState.count(farmer.SN) != 0 && farmerState[farmer.SN] == 0 
                     || farmer.NowState == 1 && farmerState.count(farmer.SN) != 0 && farmerState[farmer.SN] == 1) {
                     HumanAction(farmer.SN, nextResSN);
-                    bushHuntersNum ++;
                 }
                 if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end()) {
                     currentFarmersSN.insert(farmer.SN);       
                     HumanAction(farmer.SN, nextResSN);
-                    bushHuntersNum ++;
                 }
                 farmerState[farmer.SN] = farmer.NowState;
             }
@@ -669,7 +841,6 @@ void UsrAI::collecting()
         }
         if(allCollected) {
             lastUpdateFrame = -1;
-            bushHuntersNum = 0;
             farmerState.clear();
             huntingPhase = 0;
         }
@@ -686,7 +857,65 @@ void UsrAI::collecting()
             DebugText("stockX = " + to_string(stockX));
             DebugText("stockY = " + to_string(stockY));
             buildTasks.push_back({BUILDING_STOCK, stockX, stockY, {sns}});
-            buildTasks.push_back({BUILDING_ARROWTOWER, centerX, centerY, {}});
+
+            // 计算新箭塔坐标：参考已有箭塔(arrowTowerX,arrowTowerY)
+            // 连线斜率由参考点所在象限决定，目标是让线段尽可能"穿过"对应对角线
+            //   第一、三象限 -> 斜率1，垂直于对角线D1: x+y=100
+            //   其余象限    -> 斜率-1，垂直于对角线D2: x-y=0
+            // 约束：线段上所有点需被两塔射程覆盖(切比雪夫<=7)，故两塔切比雪夫距离<=14
+            // 目标：最小化线段上点到对角线的垂直距离的最小值
+            //   能穿过时最小值为0；无法穿过时让新塔尽量靠近对角线
+            int newArrowTowerX, newArrowTowerY;
+            {
+                int refX = (arrowTowerX >= 0) ? arrowTowerX : 50;
+                int refY = (arrowTowerY >= 0) ? arrowTowerY : 50;
+                const int R = 7;                 // 箭塔射程(块)
+                const int MAX_T = 2 * R;         // 两塔最大切比雪夫偏移
+                const int BOUND = MAP_SIZE - 1;  // 地图上界
+
+                if ((refX < 50 && refY > 50) || (refX > 50 && refY < 50)) {
+                    // 第一、三象限：连线斜率1，B=(refX+t, refY+t)，目标穿过 D1(x+y=100)
+                    int s = refX + refY - 100;  // 参考点到D1的有符号距离(未归一化)
+                    int t;
+                    if (s > 0) {
+                        // 向x+y减小方向，取可行的最小t使B尽量靠近/越过D1
+                        t = max(-MAX_T, -refX);
+                        t = max(t, -refY);
+                    } else if (s < 0) {
+                        // 向x+y增大方向
+                        t = min(MAX_T, BOUND - refX);
+                        t = min(t, BOUND - refY);
+                    } else {
+                        // 参考点已在D1上，任取正向即可穿过
+                        t = min(MAX_T, BOUND - refX);
+                        t = min(t, BOUND - refY);
+                    }
+                    if (t == 0) t = (s >= 0) ? -1 : 1;  // 避免与已有塔重合
+                    newArrowTowerX = refX + t;
+                    newArrowTowerY = refY + t;
+                } else {
+                    // 其余象限：连线斜率-1，B=(refX+t, refY-t)，目标穿过 D2(x-y=0)
+                    int s = refX - refY;  // 参考点到D2的有符号距离(未归一化)
+                    int t;
+                    if (s > 0) {
+                        // 向x-y减小方向
+                        t = max(-MAX_T, -refX);
+                        t = max(t, refY - BOUND);
+                    } else if (s < 0) {
+                        // 向x-y增大方向
+                        t = min(MAX_T, BOUND - refX);
+                        t = min(t, refY);
+                    } else {
+                        // 参考点已在D2上
+                        t = min(MAX_T, BOUND - refX);
+                        t = min(t, refY);
+                    }
+                    if (t == 0) t = (s >= 0) ? -1 : 1;
+                    newArrowTowerX = refX + t;
+                    newArrowTowerY = refY - t;
+                }
+            }
+            buildTasks.push_back({BUILDING_ARROWTOWER, newArrowTowerX, newArrowTowerY, {}});
             buildingScheduled = 1;
         }
         if(!stockBuilt) return;
@@ -694,12 +923,12 @@ void UsrAI::collecting()
         nearestGazelleSN = -1;
         int i = 0;
         for(auto& farmer: info.farmers) {
-            if(farmer.SN != builderSN) {
-                farmerTask[farmer.SN] = deadMeatResources[i];
-                HumanAction(farmer.SN, deadMeatResources[i]); 
-                i++;
-                if(i >= deadMeatResources.size()) i = 0;
-            }
+            if(hunterFarmersSN.count(farmer.SN) == 0) continue;  // 只派猎人收肉
+            farmerTask[farmer.SN] = deadMeatResources[i];
+            currentFarmersSN.insert(farmer.SN);
+            HumanAction(farmer.SN, deadMeatResources[i]); 
+            i++;
+            if(i >= deadMeatResources.size()) i = 0;
         }
         deadMeatResources.clear();
     }
@@ -746,11 +975,10 @@ void UsrAI::hunting()
     
 
     for(auto& farmer: info.farmers) {
-        if(farmer.SN != builderSN) {
-            if(farmerTask[farmer.SN] != nearestGazelleSN) {
-                farmerTask[farmer.SN] = nearestGazelleSN;
-                HumanAction(farmer.SN, nearestGazelleSN);
-            }
+        if(hunterFarmersSN.count(farmer.SN) == 0) continue;  // 只派猎人，浆果/采石/维修村民不参与狩猎
+        if(farmerTask[farmer.SN] != nearestGazelleSN) {
+            farmerTask[farmer.SN] = nearestGazelleSN;
+            HumanAction(farmer.SN, nearestGazelleSN);
         }
     }
 
@@ -796,7 +1024,10 @@ void UsrAI::logging() {
         if(candTreeSNs.empty()) return;
         for(auto& farmer : info.farmers) {
             if(candTreeSNs.empty()) break;   // 树少于农民数时停止，防止越界
-            if(farmer.SN != builderSN) {
+            // 跳过采石/维修村民，避免伐木抢走已分配的采集任务
+            if(farmer.SN != builderSN
+               && stoneFarmersSN.count(farmer.SN) == 0
+               && repairFarmersSN.count(farmer.SN) == 0) {
                 farmerState[farmer.SN] = HUMAN_STATE_WORKING;
                 HumanAction(farmer.SN, candTreeSNs.top().second);
                 candTreeSNs.pop();
@@ -810,6 +1041,7 @@ void UsrAI::logging() {
     for(auto& farmer : info.farmers) {
         if(candTreeSNs.empty()) break;       // 候选耗尽不再 pop
         if(farmer.SN == builderSN) continue;
+        if(stoneFarmersSN.count(farmer.SN) || repairFarmersSN.count(farmer.SN)) continue;
         if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end() || farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE) {
             DebugText("farmer" + to_string(farmer.SN)+" now is idle, assigning tree...");
             currentFarmersSN.insert(farmer.SN);
@@ -823,22 +1055,30 @@ void UsrAI::logging() {
 
 void UsrAI::gamePhase1() {
     static bool buildingScheduled = false;
+    static bool homeBuilt = false;
     if(info.Meat < 800){
+        if(!homeBuilt) {
+            homeBuilt = true;
+            buildTasks.push_back({BUILDING_HOME, homeX, homeY, {}});
+        }
+        // 需求2/3：新生成的村民统一分配至浆果采集（一对一）
+        if(!resourceSwitchDone) berryCollecting();
         if(huntingPhase == 0) 
             hunting();
         else
             collecting();
     } else {
         if(!buildingScheduled) {
-            buildTasks.push_back({BUILDING_ARMYCAMP, arrowTowerX, arrowTowerY, {}});
-            buildTasks.push_back({BUILDING_MARKET, arrowTowerX, arrowTowerY, {}});
-            buildTasks.push_back({BUILDING_STABLE, arrowTowerX, arrowTowerY, {}});
-            buildTasks.push_back({BUILDING_RANGE, arrowTowerX, arrowTowerY, {}});
+            buildTasks.push_back({BUILDING_ARMYCAMP, centerX, centerY, {}});
+            buildTasks.push_back({BUILDING_MARKET, centerX, centerY, {}});
+            buildTasks.push_back({BUILDING_STABLE, centerX, centerY, {}});
+            buildTasks.push_back({BUILDING_RANGE, centerX, centerY, {}});
             buildTasks.push_back({BUILDING_COLLAGE, arrowTowerX, arrowTowerY, {}});
             //buildTasks.push_back({BUILDING_MARKET_GOLD_UPGRADE, marketSN, marketSN, {}});
             buildingScheduled = true;
         }
-        assignArmy();
+
+        // fixingArrowTower 已在 processData 统一调用，此处不再重复
         logging();
         updateStage();
     }
@@ -857,6 +1097,7 @@ void UsrAI::farming() {
     nextFarmY = nextFarmPosition.second;
     if(nextFarmX == -1) return;   // 该预设点附近无合法地块，等下帧/木材变化后重试
 
+    DebugText("nextFarmX = " + to_string(nextFarmX) + ", nextFarmY = " + to_string(nextFarmY));
     for(auto& farmer: info.farmers) {
         if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end()) {
             currentFarmersSN.insert(farmer.SN);
@@ -932,6 +1173,47 @@ void UsrAI::Defense() {
     }
 }
 
+void UsrAI::fixingArrowTower() {
+    // 选择血量最低的受损箭塔（需求5：血量最低优先维修）
+    // 维修者：builder（始终优先）+ repairFarmersSN（14000帧后从采石组二次分配而来）
+    static bool flag = false;
+    static size_t lastRepairCount = 0;   // 上帧维修组人数，用于检测新增维修者后重新强制分配
+    int minBlood = INT_MAX;
+    int targetSN = -1;
+
+    if(info.Stone < 5) {
+        return;
+    }
+
+    for(auto& building : info.buildings) {
+        if(building.Type == BUILDING_ARROWTOWER && building.Blood < building.MaxBlood) {
+            if(building.Blood < minBlood) {
+                minBlood = building.Blood;
+                targetSN = building.SN;
+            }
+        }
+    }
+
+    if(targetSN == -1) return;
+
+    // 维修组人数变化时（如14000帧二次分配新增4人），重置flag以强制立即分配所有维修者
+    if(repairFarmersSN.size() != lastRepairCount) {
+        flag = false;
+        lastRepairCount = repairFarmersSN.size();
+    }
+
+    // 首次分配立即切换；之后仅派空闲的维修者，不打断正在建造/采集的人
+    for(auto& farmer : info.farmers) {
+        bool isRepairer = (farmer.SN == builderSN) || repairFarmersSN.count(farmer.SN);
+        if(!isRepairer) continue;
+        if(!flag || farmer.NowState == HUMAN_STATE_IDLE) {
+            HumanAction(farmer.SN, targetSN);
+        }
+    }
+
+    flag = true;
+}
+
 void UsrAI::gamePhase2() {
     static int collageBuilt = 1;
     static int farmBuildingPhase = 1;
@@ -948,7 +1230,8 @@ void UsrAI::gamePhase2() {
         }
         farmerInitialised = 1;
     }
-        
+
+    // fixingArrowTower 已在 processData 统一调用，此处不再重复，也不 return
     if(farmBuildingPhase){
         farming();
         if(farmNum >= maxFarmNum) 
@@ -979,7 +1262,7 @@ void UsrAI::assignFarmer()
     static int gamePhase1Over = 0;
     static int gamePhase2Over = 0;
     if(!gamePhase1Over && info.civilizationStage <= CIVILIZATION_TOOLAGE) {
-        HumanControl = 10;
+        HumanControl = 16;
         gamePhase1();
     } else if(!gamePhase2Over && checkArmy1()) {
         gamePhase1Over = 1;
@@ -1010,7 +1293,7 @@ int UsrAI::getBuildingRequiredAge(int buildingType)
         case BUILDING_ARROWTOWER: // 箭塔
             return CIVILIZATION_TOOLAGE;
         default:
-            return CIVILIZATION_STONEAGE;
+            return CIVILIZATION_BRONZEAGE;
     }
 }
 
@@ -1025,6 +1308,7 @@ int UsrAI::getBuildingWoodCost(int buildingType)
         case BUILDING_MARKET:     return 150;
         case BUILDING_RANGE:      return 150;
         case BUILDING_STABLE:     return 150;
+        case BUILDING_COLLAGE:    return 180;
         case BUILDING_FARM:       return 75;
         case BUILDING_ARROWTOWER: return 0;    // 箭塔只用石头
         default:                  return 0;
@@ -1055,10 +1339,10 @@ bool UsrAI::checkResource(int buildingType)
 void UsrAI::arrowTowerAttack(int towerSN, int BlockDR, int BlockUR)
 {
     //DebugText("current towerSN = " + to_string(towerSN));
-    static map<int, bool > haveAttacked;
+    //static map<int, bool > haveAttacked;
     static map<int, int > lastAttackFrame;
     const int attackRange = 7;
-    const int attackInterval = 60;
+    const int attackInterval = 40;
 
     if(info.GameFrame - lastAttackFrame[towerSN] < attackInterval) return;
     lastAttackFrame[towerSN] = info.GameFrame;
@@ -1066,24 +1350,16 @@ void UsrAI::arrowTowerAttack(int towerSN, int BlockDR, int BlockUR)
     set<int> candEnemySNs;
     int nextEnemySN = -1;
 
-    for(auto& enemy: info.enemy_armies) { //加入新敌人
-        if(manhattan_distance(BlockDR, BlockUR, enemy.BlockDR, enemy.BlockUR) > attackRange) continue;
-        candEnemySNs.insert(enemy.SN);
-    }
-
-    for(auto& enemySN: candEnemySNs) { //优先攻击新敌人
-        if(haveAttacked.count(enemySN) == 0) {
-            haveAttacked[enemySN] = false;
-        }
-        if(!haveAttacked[enemySN]) {
-            haveAttacked[enemySN] = true;
-            DebugText("tower " + to_string(enemySN)+" is attacking enemy " + to_string(enemySN));
-            nextEnemySN = enemySN;
-            break;
+    for(auto& enemy: info.enemy_armies) { 
+        if(abs(BlockDR - enemy.BlockDR) <= attackRange && abs(BlockUR - enemy.BlockUR) <= attackRange) {
+            candEnemySNs.insert(enemy.SN);
+            if(nextEnemySN == -1 && enemy.WorkObjectSN == priestSN) {
+                nextEnemySN = enemy.SN;
+            }
         }
     }
     
-    if(nextEnemySN != -1) {
+    if(nextEnemySN == -1) {
         double maxAtkHpRatio = 0;
         for(auto& enemy: info.enemy_armies) { //找出当前攻血比最高的敌人
             if(candEnemySNs.find(enemy.SN) == candEnemySNs.end() || enemy.Blood <= 0) continue;
@@ -1104,15 +1380,161 @@ void UsrAI::assignArmy()
             arrowTowerAttack(building.SN, building.BlockDR, building.BlockUR);
         }
     }
+
+    // 优先级：正在攻击祭祀的敌人 > 与自身不同兵种(近战/远程)的敌人 > 其他敌人；同层级内取最近
+    for(auto& army : info.armies) {
+        if(army.SN == priestSN || army.NowState != HUMAN_STATE_IDLE) continue;
+        bool armyIsMelee = (getAttackRange(army.Sort) <= 1);
+        int targetSN = -1;
+        int bestTier = 3;       // 1=攻击祭祀 2=不同兵种 3=其他
+        int bestDist = INT_MAX;
+        for(auto& enemy : info.enemy_armies) {
+            int tier;
+            if(enemy.WorkObjectSN == priestSN) {
+                tier = 1;                                        // 正在攻击祭祀，最高优先
+            } else {
+                bool enemyIsMelee = (getAttackRange(enemy.Sort) <= 1);
+                tier = (armyIsMelee != enemyIsMelee) ? 2 : 3;    // 不同兵种次之，其余再次
+            }
+            int d = manhattan_distance(enemy.BlockDR, enemy.BlockUR, army.BlockDR, army.BlockUR);
+            if(tier < bestTier || (tier == bestTier && d < bestDist)) {
+                bestTier = tier;
+                bestDist = d;
+                targetSN = enemy.SN;
+            }
+        }
+        if(targetSN != -1) {
+            HumanAction(army.SN, targetSN);
+        }
+    }
+}
+
+// 需求2/3：新生成的村民统一分配至浆果采集，单个村民与单个浆果一一对应
+void UsrAI::berryCollecting() {
+    // 开局一次性记录所有浆果资源 SN
+    if(berryResourceSNs.empty()) {
+        for(auto& r : info.resources) {
+            if(r.Type == RESOURCE_BUSH) berryResourceSNs.push_back(r.SN);
+        }
+        if(berryResourceSNs.empty()) return;  // 地图无浆果
+    }
+
+    // 当前仍可采集的浆果集合（Cnt>0）
+    set<int> available;
+    for(auto& r : info.resources) {
+        if(r.Type == RESOURCE_BUSH && r.Cnt > 0) available.insert(r.SN);
+    }
+
+    // 释放已耗尽浆果的占用
+    for(int sn : berryResourceSNs) {
+        if(available.count(sn) == 0) assignedBerrySNs.erase(sn);
+    }
+
+    for(auto& farmer : info.farmers) {
+        if(farmer.SN == builderSN) continue;
+        if(hunterFarmersSN.count(farmer.SN) || berryFarmersSN.count(farmer.SN)
+           || stoneFarmersSN.count(farmer.SN) || repairFarmersSN.count(farmer.SN)) continue;
+
+        int berrySN = -1;
+        for(int sn : berryResourceSNs) {
+            if(available.count(sn) && assignedBerrySNs.count(sn) == 0) { berrySN = sn; break; }
+        }
+        if(berrySN == -1) break;  // 浆果不够，等待回收
+
+        assignedBerrySNs.insert(berrySN);
+        berryAssignment[farmer.SN] = berrySN;
+        berryFarmersSN.insert(farmer.SN);
+        HumanAction(farmer.SN, berrySN);
+    }
+}
+
+// 需求4：采石逻辑仿照 logging，按距离仓库/市镇中心远近排序，为采石村民分配最近采石点
+void UsrAI::stoneMining() {
+    if(stoneFarmersSN.empty()) return;
+
+    static bool flag = false;              // 是否已完成首次分配：首次进入立即切换，之后做卡脚检测
+    static map<int,int> farmerState;       // 村民上一帧状态，用于卡脚检测
+
+    priority_queue<pair<int,int>, vector<pair<int,int>>, greater<pair<int,int>>> candStoneSNs;
+    const int INF = 1e9;
+    for(auto& r : info.resources) {
+        if(r.Type != RESOURCE_STONE || r.Cnt <= 0) continue;
+        int minDist = INF;
+        for(auto& b : info.buildings) {
+            if(b.Type == BUILDING_CENTER || b.Type == BUILDING_STOCK) {
+                minDist = min(minDist, manhattan_distance(b.BlockDR, b.BlockUR, r.BlockDR, r.BlockUR));
+            }
+        }
+        if(minDist != INF) candStoneSNs.push(make_pair(minDist, r.SN));
+    }
+    if(candStoneSNs.empty()) return;
+
+    for(auto& farmer : info.farmers) {
+        if(stoneFarmersSN.count(farmer.SN) == 0) continue;
+        // 首次进入立即切换；之后仅在村民卡脚(连续两帧都空闲)时重新指派
+        if(!flag || (farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE)) {
+            if(candStoneSNs.empty()) break;
+            HumanAction(farmer.SN, candStoneSNs.top().second);
+            candStoneSNs.pop();
+        }
+        farmerState[farmer.SN] = farmer.NowState;
+    }
+
+    flag = true;
+}
+
+// 需求4：食物总量>=800 且 人口>=16 时，浆果采集者转采石、猎人转伐木
+void UsrAI::resourceSwitch() {
+    if(resourceSwitchDone) return;
+    if(info.Meat < 800 || info.Human_Num < 16) return;
+    resourceSwitchDone = true;
+
+    // 浆果采集村民 → 采石
+    for(int sn : berryFarmersSN) {
+        stoneFarmersSN.insert(sn);
+    }
+    berryFarmersSN.clear();
+    berryAssignment.clear();
+
+    // 猎人 → 伐木：清空猎人标记，交回 logging() 统一认领（meat>=800 分支会调用 logging）
+    hunterFarmersSN.clear();
+}
+
+// 需求5：14000帧（第二波敌人进攻阶段）采石村民二次分配：4人继续采石，其余转箭塔维修
+void UsrAI::repairRepurpose() {
+    if(repairRepurposeDone) return;
+    if(info.GameFrame < 14000) return;
+    repairRepurposeDone = true;
+
+    // 从采石村民中选前4人继续采石，其余转维修
+    vector<int> stoneList(stoneFarmersSN.begin(), stoneFarmersSN.end());
+    const int keepStoneNum = 4;
+    for(int i = keepStoneNum; i < (int)stoneList.size(); i++) {
+        stoneFarmersSN.erase(stoneList[i]);
+        repairFarmersSN.insert(stoneList[i]);
+    }
 }
 
 void UsrAI::processData()
 {
     init();
 
-    updateTech();        
+    updateTech();
 
+    assignArmy();
     priest();
+
+    // 需求4：资源动态切换（食物>=800 && 人口>=16 → 浆果转采石 / 猎人转伐木）
+    resourceSwitch();
+    // 需求5：14000帧采石村民二次分配（4人采石 / 其余修塔）
+    repairRepurpose();
+
+    // 优先修箭塔：builder 始终 + 二次分配来的维修组，血量最低塔优先
+    // 放在 assignFarmer/assignBuilding 之前，确保维修不被建造抢占
+    fixingArrowTower();
+    // 需求4：采石村民分配最近采石点
+    stoneMining();
+
     assignFarmer();
     assignBuilding();
     
