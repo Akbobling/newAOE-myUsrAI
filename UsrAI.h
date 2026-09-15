@@ -70,6 +70,7 @@ private:
     void hunting();
     void collecting();
     void assignArmy();
+    bool isSingle(int BlockDR, int BlockUR);
     void priest();
     void logging();
     void farming();
@@ -84,6 +85,8 @@ private:
     void gamePhase1();
     void gamePhase2();
     void gamePhase3();
+    void unifiedAssign();
+    void woodUpgrade();
 };
 
 #endif

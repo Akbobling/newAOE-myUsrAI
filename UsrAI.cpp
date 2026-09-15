@@ -62,9 +62,14 @@ set<int> hunterFarmersSN;          // 猎人（开局初始村民，狩猎羚羊
 set<int> berryFarmersSN;           // 浆果采集村民（新生成村民）
 set<int> stoneFarmersSN;           // 采石村民
 set<int> repairFarmersSN;          // 箭塔维修村民（14000帧后从采石组二次分配而来）
+set<int> goldFarmersSN;            // 采金村民（gamePhase2 统一分配后的主力采集组）
+set<int> treeFarmersSN;            // 伐木村民（供应房屋/军队/科技木材；farming 每建一块田临时抽调一人）
+bool unifiedAssignDone = false;    // gamePhase2 是否已执行统一分配
 bool hunterInitialized = false;    // 猎人组是否已初始化
 bool resourceSwitchDone = false;   // 需求4：食物/人口达标后切采石+伐木
 bool repairRepurposeDone = false;  // 需求5：14000帧采石村民二次分配
+bool compositeBowDone = false;    // 复合弓科技是否升级成功（ins_ret == ACTION_SUCCESS）
+bool woodUpgradePending = true;   // 木材加工升级待下发（resourceSwitch 后置位，成功后清除）
 
 
 int UsrAI::getBuildingSideLen(int type) {
@@ -303,26 +308,33 @@ bool UsrAI::checkRequiredBuilding()
 void UsrAI::updateStage()
 {
     static int lastOrderId = -1;
-    int lastOrderTime = 0;
-    if(info.GameFrame - lastOrderTime < 100) return;
-    lastOrderTime = info.GameFrame;
+    static int lastOrderTime = 0;
 
-    if(info.Meat < BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD) DebugText("Not enough meat to upgrade center");
-    if(!checkRequiredBuilding()) DebugText("Not enough required buildings to upgrade center");
-    if(info.civilizationStage <= CIVILIZATION_TOOLAGE && info.Meat >= BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD && checkRequiredBuilding()) {
-        for(auto& building : info.buildings) {
-            if(building.Type == BUILDING_CENTER) {
-                lastOrderId = BuildingAction(building.SN, BUILDING_CENTER_UPGRADE);
-                break;
-            }
-        }
-    }
-
-    // 通过 ins_ret 获取升级铜器时代指令的状态码
+    // 上一帧升级指令结果（ins_ret 仅下一帧有效），读到后复位，便于观察真实失败码
     if(lastOrderId != -1) {
         auto it = info.ins_ret.find(lastOrderId);
         if(it != info.ins_ret.end()) {
-            DebugText("BronzeAge upgrade ins_ret code = " + to_string(it->second));
+            DebugText("BronzeAge upgrade ins_ret code = " + to_string(it->second)
+                      + " stage = " + to_string(info.civilizationStage)
+                      + " frame = " + to_string(info.GameFrame));
+            lastOrderId = -1;
+        }
+    }
+
+    // 节流：避免每帧重复下发升级指令（重复下发会重置升级进度，导致永远无法完成）
+    if(info.GameFrame - lastOrderTime < 100) return;
+    lastOrderTime = info.GameFrame;
+
+    if(info.civilizationStage <= CIVILIZATION_TOOLAGE &&
+       info.Meat >= BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD &&
+       checkRequiredBuilding()) {
+        for(auto& building : info.buildings) {
+            // 仅当市镇中心空闲时才下发，避免打断正在进行的训练/升级；也避免与 createFarmer 同帧抢占同一建筑
+            if(building.Type == BUILDING_CENTER && building.Project == ACT_NULL) {
+                lastOrderId = BuildingAction(building.SN, BUILDING_CENTER_UPGRADE);
+                DebugText("Action");
+                break;
+            }
         }
     }
 }
@@ -343,6 +355,14 @@ void UsrAI::updateTech()
 
 void UsrAI::createFarmer()
 {
+    // 升级条件已满足时暂停造农民，让市镇中心保持空闲以完成时代升级；
+    // 否则 createFarmer（在 updateStage 之后调用）会用 CREATE_FARMER 覆盖本帧的升级指令
+    if(info.civilizationStage <= CIVILIZATION_TOOLAGE &&
+       info.Meat >= BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD &&
+       checkRequiredBuilding()) {
+        return;
+    }
+
     for(auto& building : info.buildings) {
         if(building.Type == BUILDING_CENTER && building.Project == ACT_NULL &&
         info.Meat >= BUILDING_CENTER_CREATEFARMER_FOOD && info.farmers.size() < info.Human_MaxNum && info.farmers.size() < HumanControl) {
@@ -395,26 +415,92 @@ void UsrAI::priest()
             break;
         }
     }
+    if(priestX == -1) return;
 
     //DebugText("lastOrderX = " + to_string(lastOrderX) + ", lastOrderY = " + to_string(lastOrderY));
     //DebugText("manhattan_distance = " + to_string(manhattan_distance(lastOrderX,lastOrderY,priestX,priestY)))
-    if(info.GameFrame > 5500) {
-        // 需求7：转化保护——转化中且未受攻击(Blood未减少)时，暂停移动逻辑
-        if(converting) {
-            bool targetExists = false;
-            for(auto& enemy : info.enemy_armies) {
-                if(enemy.SN == convertTargetSN) { targetExists = true; break; }
-            }
-            if(targetExists && priestBlood != -1 && lastPriestBlood != -1 && priestBlood >= lastPriestBlood) {
-                return;  // 未受攻击且目标仍在：继续转化，不发移动指令
-            }
-            converting = false;  // 受到攻击或转化完成(目标消失)
+    // 需求7：转化保护——转化中且未受攻击(Blood未减少)时，暂停移动逻辑（全帧生效）
+    if(converting) {
+        bool targetExists = false;
+        for(auto& enemy : info.enemy_armies) {
+            if(enemy.SN == convertTargetSN) { targetExists = true; break; }
         }
-        lastPriestBlood = priestBlood;
-
-        if(info.GameFrame - lastOrderFrame < retryInterval) {
+        if(targetExists && priestBlood != -1 && lastPriestBlood != -1 && priestBlood >= lastPriestBlood) {
             return;
         }
+        converting = false;
+    }
+    lastPriestBlood = priestBlood;
+
+    // 统一节流：视野范围内有敌人时每 20 帧发一次指令，否则 50 帧，
+    // 修复探索期到达目标后每帧刷 HumanMove 同一点
+    // 视野按内核 getViewLab 的圆形判定（欧式距离 <= VISION_PRIEST）
+    bool enemyInVision = false;
+    for(auto& enemy : info.enemy_armies) {
+        int dx = enemy.BlockDR - priestX;
+        int dy = enemy.BlockUR - priestY;
+        if(dx * dx + dy * dy <= VISION_PRIEST * VISION_PRIEST) {
+            enemyInVision = true;
+            break;
+        }
+    }
+    int interval = enemyInVision ? 20 : retryInterval;
+    if(info.GameFrame - lastOrderFrame < interval) {
+        return;
+    }
+
+    // 需求：近战敌人3格以内（切比雪夫）时，围绕最近箭塔绕圈风筝，借箭塔火力消耗追击敌人
+    {
+        bool meleeNear = false;
+        for(auto& enemy : info.enemy_armies) {
+            if(getAttackRange(enemy.Sort) <= 1
+               && max(abs(enemy.BlockDR - priestX), abs(enemy.BlockUR - priestY)) <= 3) {
+                meleeNear = true;
+                break;
+            }
+        }
+        if(meleeNear) {
+            int towerX = -1, towerY = -1, towerMinDist = INT_MAX;
+            for(auto& b : info.buildings) {
+                if(b.Type == BUILDING_ARROWTOWER && b.Blood >= 10) {
+                    int d = manhattan_distance(b.BlockDR, b.BlockUR, priestX, priestY);
+                    if(d < towerMinDist) { towerMinDist = d; towerX = b.BlockDR; towerY = b.BlockUR; }
+                }
+            }
+            if(towerX != -1) {
+                static const int ringDx[8] = {4, 4, 0, -4, -4, -4, 0, 4};
+                static const int ringDy[8] = {0, 4, 4, 4, 0, -4, -4, -4};
+                static int circleIdx = 0;
+                static int circleTowerX = -1, circleTowerY = -1;
+                if(towerX != circleTowerX || towerY != circleTowerY) {
+                    circleTowerX = towerX;
+                    circleTowerY = towerY;
+                    int best = INT_MAX;
+                    for(int k = 0; k < 8; k++) {
+                        int d = max(abs(priestX - (towerX + ringDx[k])), abs(priestY - (towerY + ringDy[k])));
+                        if(d < best) { best = d; circleIdx = k; }
+                    }
+                }
+                for(int k = 0; k < 8; k++) {
+                    int idx = (circleIdx + k) % 8;
+                    int wx = circleTowerX + ringDx[idx];
+                    int wy = circleTowerY + ringDy[idx];
+                    if(wx < 0 || wx >= MAP_SIZE || wy < 0 || wy >= MAP_SIZE) continue;
+                    if(gameMap[wx][wy] != 0) continue;
+                    if(abs(priestX - wx) <= 1 && abs(priestY - wy) <= 1) { circleIdx = (idx + 1) % 8; continue; }
+                    HumanMove(priestSN, wx * BLOCKSIDELENGTH, wy * BLOCKSIDELENGTH);
+                    lastOrderX = wx;
+                    lastOrderY = wy;
+                    lastPriestX = priestX;
+                    lastPriestY = priestY;
+                    lastOrderFrame = info.GameFrame;
+                    return;
+                }
+            }
+        }
+    }
+
+    if(info.GameFrame > 5500) {
         int nextX = -1, nextY = -1;
 
         if(enemyAtkRangeMap[priestX][priestY] == 1) {
@@ -441,6 +527,43 @@ void UsrAI::priest()
             if(towerX != -1 && enemyX != -1) {
                 bool enemyInTowerRange = (abs(enemyX - towerX) <= TOWER_RANGE && abs(enemyY - towerY) <= TOWER_RANGE);
                 if(!enemyInTowerRange) {
+                    // 需求：攻击祭祀的是战车弓兵时，取战车弓兵群中心，祭祀背离中心方向移动
+                    // （群中心 = 所有攻击祭祀的战车弓兵的位置均值；远程沿塔边撤退的原逻辑只处理非战车弓兵）
+                    double chariotCenterX = 0, chariotCenterY = 0;
+                    int chariotAtkNum = 0;
+                    for(auto& enemy : info.enemy_armies) {
+                        if(enemy.WorkObjectSN == priestSN && enemy.Sort == AT_CHARIOT_ARCHER) {
+                            chariotCenterX += enemy.BlockDR;
+                            chariotCenterY += enemy.BlockUR;
+                            chariotAtkNum++;
+                        }
+                    }
+                    if(chariotAtkNum > 0) {
+                        chariotCenterX /= chariotAtkNum;
+                        chariotCenterY /= chariotAtkNum;
+                        // 背离中心方向 = 祭司位置 - 群中心；步长取 6 格（战车弓兵射程外拉开距离）
+                        int dirX = priestX - (int)(chariotCenterX + 0.5);
+                        int dirY = priestY - (int)(chariotCenterY + 0.5);
+                        if(dirX == 0 && dirY == 0) dirX = 1;   // 重合时给默认方向
+                        // 归一化方向，沿方向最多走 6 格
+                        double len = sqrt((double)dirX * dirX + (double)dirY * dirY);
+                        // 沿方向逐格回退，直到找到界内且未被占用的合法点
+                        int fleeX = -1, fleeY = -1;
+                        for(int back = 6; back >= 1; back--) {
+                            int tx = priestX + (int)(dirX / len * back + (dirX >= 0 ? 0.5 : -0.5));
+                            int ty = priestY + (int)(dirY / len * back + (dirY >= 0 ? 0.5 : -0.5));
+                            if(tx < 0 || tx >= MAP_SIZE || ty < 0 || ty >= MAP_SIZE) continue;
+                            if(gameMap[tx][ty] != 0) continue;
+                            fleeX = tx; fleeY = ty;
+                            break;
+                        }
+                        if(fleeX != -1) {
+                            nextX = fleeX; nextY = fleeY;
+                            HumanMove(priestSN, fleeX * BLOCKSIDELENGTH, fleeY * BLOCKSIDELENGTH);
+                            handled = true;
+                        }
+                    }
+                    if(!handled) {
                     // 3) 在箭塔射程边缘(切比雪夫==TOWER_RANGE)找合法点：离远程敌人最远、离祭祀尽量近
                     int bestX = -1, bestY = -1;
                     int bestToEnemy = -1;
@@ -463,6 +586,7 @@ void UsrAI::priest()
                         HumanMove(priestSN, bestX * BLOCKSIDELENGTH, bestY * BLOCKSIDELENGTH);
                         handled = true;
                     }
+                    }
                 }
             }
 
@@ -480,19 +604,48 @@ void UsrAI::priest()
                 HumanMove(priestSN, nextX * BLOCKSIDELENGTH, nextY * BLOCKSIDELENGTH);
             }
         } else {
-            // 需求7：不在任何仇恨敌人攻击范围内时，选择最近的敌方方阵兵进行转化
-            int targetSN = -1;
-            int minDist = INT_MAX;
+            // 需求7：不在任何仇恨敌人攻击范围内时，转化仇恨在我方箭塔身上的敌军单位
+            // 约束1：只能选择 WorkObjectSN 指向我方箭塔的敌人（正被箭塔攻击/吸引火力的单位，转化时机最安全）
+            // 约束2：该次转化成功前只锁定该单位——目标从 enemy_armies 消失（转化成功/阵亡）才允许换目标
+
+            // 目标锁定：当前目标仍存活则继续下达同一目标（含被打断后重新读条的情形）
+            bool targetAlive = false;
             for(auto& enemy : info.enemy_armies) {
-                if(enemy.Sort == AT_HOPLITE) {
-                    int d = manhattan_distance(enemy.BlockDR, enemy.BlockUR, priestX, priestY);
-                    if(d < minDist) { minDist = d; targetSN = enemy.SN; }
-                }
+                if(enemy.SN == convertTargetSN && enemy.Blood > 0) { targetAlive = true; break; }
             }
-            if(targetSN != -1) {
-                HumanAction(priestSN, targetSN);  // 转化（内核 ATTACKTYPE_CHANGE）
+            if(convertTargetSN != -1 && !targetAlive) {
+                convertTargetSN = -1;   // 转化成功或目标阵亡，解锁换目标
+            }
+
+            if(convertTargetSN == -1) {
+                // 收集我方友军（箭塔 + 我方单位/军队）SN 集合
+                set<int> myFriendSNs;
+                for(auto& b : info.buildings) {
+                    if(b.Blood > 0) myFriendSNs.insert(b.SN);   // 所有友方建筑（含箭塔）
+                }
+                for(auto& army : info.armies) {
+                    if(army.Blood > 0) myFriendSNs.insert(army.SN);   // 我方军队
+                }
+                // 两轮筛选：仇恨已在友军身上（含箭塔）的前提下，优先选择最近的方阵兵(AT_HOPLITE)转化；
+                // 无方阵兵时退化为选择最近的满足仇恨条件的任意敌军单位
+                int minDistPhalanx = INT_MAX, minDistAny = INT_MAX;
+                int phalanxSN = -1, anySN = -1;
+                for(auto& enemy : info.enemy_armies) {
+                    if(enemy.Blood <= 0) continue;
+                    if(myFriendSNs.find(enemy.WorkObjectSN) == myFriendSNs.end()) continue;   // 仇恨必须在友军（含箭塔）身上
+                    int d = manhattan_distance(enemy.BlockDR, enemy.BlockUR, priestX, priestY);
+                    if(enemy.Sort == AT_HOPLITE) {
+                        if(d < minDistPhalanx) { minDistPhalanx = d; phalanxSN = enemy.SN; }
+                    } else {
+                        if(d < minDistAny) { minDistAny = d; anySN = enemy.SN; }
+                    }
+                }
+                convertTargetSN = (phalanxSN != -1) ? phalanxSN : anySN;
+            }
+
+            if(convertTargetSN != -1) {
+                HumanAction(priestSN, convertTargetSN);  // 转化（内核 ATTACKTYPE_CHANGE）
                 converting = true;
-                convertTargetSN = targetSN;
                 nextX = priestX;  // 未移动，占位避免 lastOrder 记录越界
                 nextY = priestY;
             } else {
@@ -512,7 +665,7 @@ void UsrAI::priest()
                 }
                 midX /= arrowTowerNum;
                 midY /= arrowTowerNum;
-                pair<int,int> target = legalPlaceAround(BUILDING_HOME, midX, midY);
+                pair<int,int> target = legalPlaceAround(114514, midX, midY);
                 if(target.first == -1) {
                     DebugText("No legal place for priest");
                     return;
@@ -559,6 +712,7 @@ void UsrAI::priest()
     for(int i=0;i<MAP_SIZE;i++) {
         for(int j=0;j<MAP_SIZE;j++) {
             if(manhattan_distance(i,j,centerX,centerY) > 45 || gameMap[i][j] == -1 || gameMap[i][j] == 1) continue;
+            if(i == priestX && j == priestY) continue;
             int totalValue = 0;
             for (int dx = -radius; dx <= radius; ++dx) {
                 for (int dy = -(radius - abs(dx)); dy <= radius - abs(dx); ++dy) {
@@ -656,10 +810,10 @@ void UsrAI::assignBuilding()
     }
     if(!buildTasks.empty() && builder.NowState == 0) {
         auto task = buildTasks.front();
-        if(checkResource(task.Type)) {
-            if(task.BlockDR > MAP_SIZE) {
-                BuildingAction(task.BlockDR, task.Type); //BUILDING_MARKET_WOOD_UPGRADE
-            } else {
+        if(task.BlockDR > MAP_SIZE) {
+            return;
+        } else {
+            if(checkResource(task.Type)) {
                 pair<int,int> target = legalPlaceAround(task.Type, task.BlockDR, task.BlockUR);
                 if(target.first == -1) {
                     DebugText("No legal place for target building");
@@ -848,7 +1002,8 @@ void UsrAI::collecting()
         if(!buildingScheduled) {
             vector<int> sns;
             for(auto& farmer: info.farmers) {
-                if(farmer.SN != builderSN) {
+                // 只派猎人参与建仓库，避免覆盖浆果/采石/维修村民的 HumanAction 指令
+                if(farmer.SN != builderSN && hunterFarmersSN.count(farmer.SN)) {
                     sns.push_back(farmer.SN);
                 }
             }
@@ -870,7 +1025,7 @@ void UsrAI::collecting()
                 int refX = (arrowTowerX >= 0) ? arrowTowerX : 50;
                 int refY = (arrowTowerY >= 0) ? arrowTowerY : 50;
                 const int R = 7;                 // 箭塔射程(块)
-                const int MAX_T = 2 * R;         // 两塔最大切比雪夫偏移
+                const int MAX_T = R - 2;         // 两塔最大切比雪夫偏移
                 const int BOUND = MAP_SIZE - 1;  // 地图上界
 
                 if ((refX < 50 && refY > 50) || (refX > 50 && refY < 50)) {
@@ -993,73 +1148,119 @@ void UsrAI::hunting()
 
 }
 
-void UsrAI::logging() {
-    static priority_queue<pair<int,int>, vector<pair<int,int>>, greater<pair<int,int>>> candTreeSNs;
-    static map<int,int> farmerState;
-    static int lastOrderFrame = -1;
-    const double INF = 1e9;
-    const int orderInterval = 50;
-    if(candTreeSNs.empty()) {
-        for(auto& resource : info.resources) {
-            bool isSingle = treeCoverMap[resource.BlockDR][resource.BlockUR] <= 1;
-            if(resource.Type == RESOURCE_TREE) {
-                DebugText("X = " + to_string(resource.BlockDR) + ", Y = " + to_string(resource.BlockUR));
-                DebugText("isSingle = " + to_string(isSingle));
-            }
-            if(resource.Type == RESOURCE_TREE && isSingle) {
-                int minDistance = INF;
-                for(auto& building : info.buildings) {
-                    if(building.Type == BUILDING_CENTER || building.Type == BUILDING_STOCK) {
-                        minDistance = min(minDistance, manhattan_distance(building.BlockDR, building.BlockUR, resource.BlockDR, resource.BlockUR));
-                    }
-                }
-                if(minDistance != INF) {
-                    candTreeSNs.push(make_pair(minDistance, resource.SN));
-                }
-                if(resource.BlockDR >= 25 && resource.BlockUR <= 27 && resource.BlockUR >= 77 && resource.BlockUR <= 79) {
-                    DebugText("minDistance = " + to_string(minDistance));
-                }
-            }
+bool UsrAI::isSingle(int BlockDR, int BlockUR) {
+    if(treeCoverMap[BlockDR][BlockUR] > 1) return false;
+    int emptyNeighborCnt = 0 ;
+    for(int i = 0; i < 8; i++) {
+        if(treeCoverMap[BlockDR + dx[i]][BlockUR + dy[i]] <= 1) {
+            emptyNeighborCnt++;
         }
-        if(candTreeSNs.empty()) return;
-        for(auto& farmer : info.farmers) {
-            if(candTreeSNs.empty()) break;   // 树少于农民数时停止，防止越界
-            // 跳过采石/维修村民，避免伐木抢走已分配的采集任务
-            if(farmer.SN != builderSN
-               && stoneFarmersSN.count(farmer.SN) == 0
-               && repairFarmersSN.count(farmer.SN) == 0) {
-                farmerState[farmer.SN] = HUMAN_STATE_WORKING;
-                HumanAction(farmer.SN, candTreeSNs.top().second);
-                candTreeSNs.pop();
-            }
+    }
+    return emptyNeighborCnt >= 3;
+}
+
+void UsrAI::logging() {
+    static map<int,int> farmerState;         // 农民SN -> 上帧状态
+    static map<int,int> farmerTreeAssignment; // 农民SN -> 树SN（保证每人一棵独占树）
+    static set<int> occupiedTreeSNs;        // 当前被占用（含已砍完未释放）的树 SN
+    static int lastOrderFrame = -1;
+    const int orderInterval = 30;
+
+    // 每次分配新树时实时搜索：距离仓库/市镇中心最近的、符合 isSingle、未被任何村民占用的树
+    // 树砍完后从占用集合释放（资源列表中消失即视为砍完）
+    {
+        // 清理已消失（砍完）的树：占用集合和分配表中都不存在的资源
+        set<int> liveTreeSNs;
+        for(auto& r : info.resources)
+            if(r.Type == RESOURCE_TREE) liveTreeSNs.insert(r.SN);
+        for(auto it = occupiedTreeSNs.begin(); it != occupiedTreeSNs.end();) {
+            if(liveTreeSNs.count(*it) == 0) it = occupiedTreeSNs.erase(it);
+            else ++it;
+        }
+        for(auto it = farmerTreeAssignment.begin(); it != farmerTreeAssignment.end();) {
+            if(liveTreeSNs.count(it->second) == 0) it = farmerTreeAssignment.erase(it);
+            else ++it;
         }
     }
 
+    auto findNearestFreeTree = [&]() -> int {
+        int bestSN = -1, bestDist = INT_MAX;
+        for(auto& resource : info.resources) {
+            if(resource.Type != RESOURCE_TREE) continue;
+            if(occupiedTreeSNs.count(resource.SN)) continue;   // 已被占用
+            if(!isSingle(resource.BlockDR, resource.BlockUR)) continue;
+            int minDist = INT_MAX;
+            for(auto& building : info.buildings) {
+                if(building.Type == BUILDING_CENTER || building.Type == BUILDING_STOCK) {
+                    minDist = min(minDist, manhattan_distance(building.BlockDR, building.BlockUR,
+                                                               resource.BlockDR, resource.BlockUR));
+                }
+            }
+            if(minDist == INT_MAX) continue;   // 地图上无仓库/中心（理论不可达）
+            if(minDist < bestDist) { bestDist = minDist; bestSN = resource.SN; }
+        }
+        return bestSN;
+    };
+
+    // gamePhase2 统一分配后：伐木工只从 treeFarmersSN 中产生（含卡脚重派），
+    // 保障房屋/军队/科技的木材供应
+    if(unifiedAssignDone) {
+        if(info.GameFrame - lastOrderFrame <= orderInterval) return;
+        lastOrderFrame = info.GameFrame;
+
+        for(auto& farmer : info.farmers) {
+            if(treeFarmersSN.count(farmer.SN) == 0) continue;    // 只认伐木组
+            // 新人（无分配）或卡脚（连续两帧空闲）时分配/重派最近的空闲独占树
+            if(farmerTreeAssignment.find(farmer.SN) == farmerTreeAssignment.end()
+               || (farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE)) {
+                int treeSN = findNearestFreeTree();
+                if(treeSN == -1) break;   // 无可分配的树
+                // 重派时释放旧树
+                auto it = farmerTreeAssignment.find(farmer.SN);
+                if(it != farmerTreeAssignment.end()) occupiedTreeSNs.erase(it->second);
+                farmerTreeAssignment[farmer.SN] = treeSN;
+                occupiedTreeSNs.insert(treeSN);
+                HumanAction(farmer.SN, treeSN);
+            }
+            farmerState[farmer.SN] = farmer.NowState;
+        }
+        return;
+    }
+
+    // gamePhase1 逻辑：未标记村民由伐木认领（同一棵树独占机制，与 gamePhase2 分支一致）
     if(info.GameFrame - lastOrderFrame <= orderInterval) return;
     lastOrderFrame = info.GameFrame;
 
     for(auto& farmer : info.farmers) {
-        if(candTreeSNs.empty()) break;       // 候选耗尽不再 pop
         if(farmer.SN == builderSN) continue;
-        if(stoneFarmersSN.count(farmer.SN) || repairFarmersSN.count(farmer.SN)) continue;
-        if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end() || farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE) {
-            DebugText("farmer" + to_string(farmer.SN)+" now is idle, assigning tree...");
-            currentFarmersSN.insert(farmer.SN);
-            HumanAction(farmer.SN, candTreeSNs.top().second);
-            candTreeSNs.pop();
+        // 跳过采石/维修/浆果/猎人/采金村民，避免伐木抢走已分配的采集任务
+        if(stoneFarmersSN.count(farmer.SN) || repairFarmersSN.count(farmer.SN)
+           || berryFarmersSN.count(farmer.SN) || hunterFarmersSN.count(farmer.SN)
+           || goldFarmersSN.count(farmer.SN)) continue;
+        // 新人（无分配）或卡脚（连续两帧空闲）时分配/重派最近的空闲独占树
+        if(farmerTreeAssignment.find(farmer.SN) == farmerTreeAssignment.end()
+           || (farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE)) {
+            int treeSN = findNearestFreeTree();
+            if(treeSN == -1) break;   // 无可分配的树
+            auto it = farmerTreeAssignment.find(farmer.SN);
+            if(it != farmerTreeAssignment.end()) occupiedTreeSNs.erase(it->second);
+            farmerTreeAssignment[farmer.SN] = treeSN;
+            occupiedTreeSNs.insert(treeSN);
+            HumanAction(farmer.SN, treeSN);
         }
         farmerState[farmer.SN] = farmer.NowState;
     }
-
 }
 
 void UsrAI::gamePhase1() {
     static bool buildingScheduled = false;
     static bool homeBuilt = false;
-    if(info.Meat < 800){
+    if(info.Meat < 900){
         if(!homeBuilt) {
             homeBuilt = true;
             buildTasks.push_back({BUILDING_HOME, homeX, homeY, {}});
+            DebugText("[homeDBG] phase1 initial home pushed @(" + to_string(homeX) + "," + to_string(homeY)
+                      + ") frame=" + to_string(info.GameFrame));
         }
         // 需求2/3：新生成的村民统一分配至浆果采集（一对一）
         if(!resourceSwitchDone) berryCollecting();
@@ -1079,6 +1280,17 @@ void UsrAI::gamePhase1() {
         }
 
         // fixingArrowTower 已在 processData 统一调用，此处不再重复
+        // 切换后保留的浆果/羚羊农民继续采集食物，采完空闲后由 logging() 统一收编伐木
+        if(resourceSwitchDone) {
+            berryCollecting();                 // 只维护保留的浆果农民，不再新增采集者
+            if(huntingPhase == 0) hunting(); else collecting();
+            // 羚羊/肉采集完毕（无活羚羊）时，释放猎人，交回 logging() 统一分配
+            bool liveGazelle = false;
+            for(auto& r : info.resources)
+                if(r.Type == RESOURCE_GAZELLE && r.Cnt > 0) { liveGazelle = true; break; }
+            if(!liveGazelle && deadMeatResources.empty() && huntingPhase == 0)
+                hunterFarmersSN.clear();
+        }
         logging();
         updateStage();
     }
@@ -1098,14 +1310,15 @@ void UsrAI::farming() {
     if(nextFarmX == -1) return;   // 该预设点附近无合法地块，等下帧/木材变化后重试
 
     DebugText("nextFarmX = " + to_string(nextFarmX) + ", nextFarmY = " + to_string(nextFarmY));
-    for(auto& farmer: info.farmers) {
-        if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end()) {
-            currentFarmersSN.insert(farmer.SN);
-            farmerTask[farmer.SN] = BUILDING_FARM;
-            HumanBuild(farmer.SN, BUILDING_FARM, nextFarmX, nextFarmY);
-            farmNum++;
-            break;
-        }
+    // 每建一块农田，从伐木组临时抽调一人；建完田该村民自动开始耕作（内核建完即驻田工作）
+    if(!treeFarmersSN.empty()) {
+        int sn = *treeFarmersSN.begin();
+        treeFarmersSN.erase(sn);              // 移出伐木组，避免 logging() 再派他去伐木
+        currentFarmersSN.insert(sn);
+        farmerTask[sn] = BUILDING_FARM;
+        HumanBuild(sn, BUILDING_FARM, nextFarmX, nextFarmY);
+        farmNum++;
+        return;
     }
 
     if(info.Wood < BUILD_FARM_WOOD || farmNum >= FARM_SLOTS) return;
@@ -1114,14 +1327,41 @@ void UsrAI::farming() {
     nextFarmY = nextFarmPosition.second;
     if(nextFarmX == -1) return;
 
-    for(auto& farmer: info.farmers) {
-        if(farmer.SN != builderSN && farmerTask[farmer.SN] != 2) { //1表示logging 2表示farming
-            HumanBuild(farmer.SN, BUILDING_FARM, nextFarmX, nextFarmY);
-            farmerTask[farmer.SN] = 2;
-            farmNum++;
-            break;
-        }
+    // 第二块同帧农田：同样从伐木组抽调
+    if(!treeFarmersSN.empty()) {
+        int sn = *treeFarmersSN.begin();
+        treeFarmersSN.erase(sn);
+        HumanBuild(sn, BUILDING_FARM, nextFarmX, nextFarmY);
+        farmerTask[sn] = 2;
+        farmNum++;
     }
+}
+
+// gamePhase2 统一分配（仅执行一次）：
+// 1) 伐木工(treeFarmersSN)保留，持续供应房屋/军队/科技的木材需求；
+// 2) 所有 repairFarmer 和 stoneFarmer 全部归入 goldMiner（goldFarmersSN）；
+// 3) 之后新村民一律进 goldFarmersSN 挖金矿；
+// 4) farming 每建一块农田时，从 treeFarmersSN 临时抽调一人转入耕作组，
+//    建造者建完田后自动开始耕作。
+void UsrAI::unifiedAssign() {
+    if(unifiedAssignDone) return;
+    unifiedAssignDone = true;
+
+    // 收集进入 gamePhase2 前的"伐木工"快照：所有不属于任何已知工种、非 builder 的在册村民
+    // 此时浆果/猎人组已由 resourceSwitch 释放（resourceSwitchDone 时两组为空），
+    // 因此未被 berry/hunter/stone/repair 标记的村民即当前伐木工（treeFarmer）
+    for(auto& farmer : info.farmers) {
+        if(farmer.SN == builderSN) continue;
+        if(berryFarmersSN.count(farmer.SN) || hunterFarmersSN.count(farmer.SN)) continue;
+        if(stoneFarmersSN.count(farmer.SN) || repairFarmersSN.count(farmer.SN)) continue;
+        treeFarmersSN.insert(farmer.SN);   // 保留伐木组，不删
+    }
+
+    // 采石组 → 全部归入采金组（清空原工种标记，stoneMining 之后自然空转）
+    for(int sn : stoneFarmersSN)  goldFarmersSN.insert(sn);
+    stoneFarmersSN.clear();
+    // 维修组保留为常设工种（repairFarmersSN 不清空）：敌人在视野内时随时可修复箭塔；
+    // 空闲期（无敌人且无可修箭塔）由 gamePhase2 临时借调去挖金（SN 进出 goldFarmersSN）
 }
 
 void UsrAI::goldMining() {
@@ -1131,22 +1371,64 @@ void UsrAI::goldMining() {
     if(first) {
         bestCluster = findBestGoldCluster();
         if(bestCluster.sns.empty()) return;
-        buildTasks.push_back({BUILDING_STOCK, bestCluster.centerX, bestCluster.centerY, {} });
+        // 仅当金矿簇中心到最近仓库(中心/仓库)的曼哈顿距离 > 8 时，才在簇旁建新仓库，方便卸矿
+        int minDist = INT_MAX;
+        for(auto& building : info.buildings) {
+            if(building.Type == BUILDING_CENTER || building.Type == BUILDING_STOCK) {
+                minDist = min(minDist, manhattan_distance(building.BlockDR, building.BlockUR,
+                                                          bestCluster.centerX, bestCluster.centerY));
+            }
+        }
+        if(minDist > 8)
+            buildTasks.push_back({BUILDING_STOCK, bestCluster.centerX, bestCluster.centerY, {} });
         first = 0;
     }
-    for(auto& farmer: info.farmers) {
-        if(currentFarmersSN.find(farmer.SN) == currentFarmersSN.end()) {
-            currentFarmersSN.insert(farmer.SN);
-            farmerTask[farmer.SN] = 3; // 3表示mining
-            HumanAction(farmer.SN, bestCluster.sns[curIndex++]);
-            if(curIndex >= bestCluster.sns.size()) curIndex = 0;
+    // 采金组按 goldFarmersSN 维护（统一分配后的唯一采集主力），仿 stoneMining 模式：
+    // 首次进入立即指派，之后仅在村民卡脚(连续两帧空闲)时重新指派
+    if(goldFarmersSN.empty()) return;
+
+    static bool flag = false;
+    static map<int,int> farmerState;
+
+    priority_queue<pair<int,int>, vector<pair<int,int>>, greater<pair<int,int>>> candGoldSNs;
+    const int INF = 1e9;
+    for(auto& r : info.resources) {
+        if(r.Type != RESOURCE_GOLD || r.Cnt <= 0) continue;
+        int minDist = INF;
+        for(auto& b : info.buildings) {
+            if(b.Type == BUILDING_CENTER || b.Type == BUILDING_STOCK) {
+                minDist = min(minDist, manhattan_distance(b.BlockDR, b.BlockUR, r.BlockDR, r.BlockUR));
+            }
         }
+        if(minDist != INF) candGoldSNs.push(make_pair(minDist, r.SN));
     }
+    if(candGoldSNs.empty()) return;
+
+    for(auto& farmer : info.farmers) {
+        if(goldFarmersSN.count(farmer.SN) == 0) continue;
+        if(!flag || (farmerState[farmer.SN] == HUMAN_STATE_IDLE && farmer.NowState == HUMAN_STATE_IDLE)) {
+            if(candGoldSNs.empty()) break;
+            HumanAction(farmer.SN, candGoldSNs.top().second);
+            candGoldSNs.pop();
+        }
+        farmerState[farmer.SN] = farmer.NowState;
+    }
+
+    flag = true;
 }
 
 void UsrAI::createArmy1() {
     static int hopliteNum = 0;
     const int maxHopliteNum = 5;
+    for(auto& building : info.buildings) {
+        if(building.Type == BUILDING_RANGE && building.Project == ACT_NULL && info.Human_Num < info.Human_MaxNum) {
+            // 第二阶段：只训练复合弓兵（40食物+20黄金），不造战车弓兵
+            if(compositeBowDone && info.Meat >= BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_FOOD
+               && info.Gold >= BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_GOLD) {
+                BuildingAction(building.SN, BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN);
+            }
+        }
+    }
     for(auto& building : info.buildings) {
         if(building.Type == BUILDING_COLLAGE && building.Project == ACT_NULL && info.Meat >= BUILDING_COLLAGE_CREATE_HOPLITE_FOOD 
             && info.Gold >= BUILDING_COLLAGE_CREATE_HOPLITE_GOLD && hopliteNum < maxHopliteNum && info.Human_Num < info.Human_MaxNum) {
@@ -1175,13 +1457,18 @@ void UsrAI::Defense() {
 
 void UsrAI::fixingArrowTower() {
     // 选择血量最低的受损箭塔（需求5：血量最低优先维修）
-    // 维修者：builder（始终优先）+ repairFarmersSN（14000帧后从采石组二次分配而来）
+    // 维修者：仅 repairFarmersSN（14000帧后从采石组二次分配而来），builder 专注建造建筑
     static bool flag = false;
     static size_t lastRepairCount = 0;   // 上帧维修组人数，用于检测新增维修者后重新强制分配
     int minBlood = INT_MAX;
     int targetSN = -1;
 
-    if(info.Stone < 5) {
+    if(info.Stone < 50) {
+        static int dbgStoneFrame = -10000;   // 调试：石料不足导致的提前返回
+        if(info.GameFrame - dbgStoneFrame >= 50 && !repairFarmersSN.empty()) {
+            dbgStoneFrame = info.GameFrame;
+            DebugText("[repairDBG] fixingArrowTower skipped: stone=" + to_string(info.Stone) + " < 50");
+        }
         return;
     }
 
@@ -1202,11 +1489,26 @@ void UsrAI::fixingArrowTower() {
         lastRepairCount = repairFarmersSN.size();
     }
 
-    // 首次分配立即切换；之后仅派空闲的维修者，不打断正在建造/采集的人
+    // 敌人在场时强制重派（每 50 帧一次）：打断借调期间遗留的挖金动作，
+    // 否则从金矿召回的维修工 state=2（工作中）永远不满足 IDLE 条件，拿不到修复指令
+    static int forceFrame = -10000;
+    bool enemyPresent = !info.enemy_armies.empty();
+    bool forceReassign = false;
+    if(enemyPresent && info.GameFrame - forceFrame >= 50) {
+        forceFrame = info.GameFrame;
+        forceReassign = true;
+    }
+
+    // 首次分配立即切换；之后仅派空闲的维修者，不打断正在建造/采集的人（敌人在场时强制重派例外）
     for(auto& farmer : info.farmers) {
-        bool isRepairer = (farmer.SN == builderSN) || repairFarmersSN.count(farmer.SN);
-        if(!isRepairer) continue;
-        if(!flag || farmer.NowState == HUMAN_STATE_IDLE) {
+        if(repairFarmersSN.count(farmer.SN) == 0) continue;
+        if(!flag || farmer.NowState == HUMAN_STATE_IDLE || forceReassign) {
+            // 调试：记录指令实际下发（目标塔 SN + 农民 SN + 状态）
+            DebugText("[repairDBG] fix order: farmer=" + to_string(farmer.SN)
+                      + " -> tower=" + to_string(targetSN)
+                      + " state=" + to_string(farmer.NowState)
+                      + (forceReassign ? " FORCED" : "")
+                      + " frame=" + to_string(info.GameFrame));
             HumanAction(farmer.SN, targetSN);
         }
     }
@@ -1219,42 +1521,338 @@ void UsrAI::gamePhase2() {
     static int farmBuildingPhase = 1;
     static int farmerInitialised = 0;
     static int miningPhase = 0;
-    const int maxFarmNum = 8;
 
-    if(!farmerInitialised) {
-        for(auto& farmer: info.farmers) {
-            currentFarmersSN.insert(farmer.SN);
-            if(farmer.SN != builderSN) {
-                farmerTask[farmer.SN] = 1; // 1表示logging 2表示farming
+    // 车轮升级：每 30 帧尝试一次，下发后用 ins_ret 判定是否成功（研究已开始），
+    // 成功则永久停止；失败或未收到回执则在下一个 30 帧窗口继续尝试
+    {
+        static int wheelOrderId = -1;
+        static int wheelOrderFrame = -10000;
+        static bool wheelDone = false;
+
+        // 上一条指令结果（ins_ret 仅下一帧有效），必须在节流判断前读取，读到即复位
+        if(!wheelDone && wheelOrderId != -1) {
+            auto it = info.ins_ret.find(wheelOrderId);
+            if(it != info.ins_ret.end()) {
+                DebugText("Wheel upgrade ins_ret code = " + to_string(it->second)
+                          + " frame = " + to_string(info.GameFrame));
+                if(it->second == ACTION_SUCCESS) wheelDone = true;
+                wheelOrderId = -1;
             }
         }
-        farmerInitialised = 1;
-    }
 
-    // fixingArrowTower 已在 processData 统一调用，此处不再重复，也不 return
-    if(farmBuildingPhase){
-        farming();
-        if(farmNum >= maxFarmNum) 
-            farmBuildingPhase = 0;
-    } else if(miningPhase || buildTasks.empty()){
-        goldMining();
-        createArmy1();
-        Defense();
-        if(!miningPhase) {
-            buildTasks.push_back({BUILDING_MARKET_GOLD_UPGRADE, marketSN, marketSN, {}});
-            miningPhase = 1;
+        if(!wheelDone && info.GameFrame - wheelOrderFrame >= 30) {
+            wheelOrderFrame = info.GameFrame;   // 无论本次是否发出指令，都推进窗口，严格 30 帧一查
+            for(auto& building : info.buildings) {
+                if(building.Type == BUILDING_MARKET && building.Project == ACT_NULL
+                    && info.Meat >= BUILDING_MARKET_WHEEL_UPGRADE_FOOD
+                    && info.Wood >= BUILDING_MARKET_WHEEL_UPGRADE_WOOD) {
+                    wheelOrderId = BuildingAction(building.SN, BUILDING_MARKET_WHEEL_UPGRADE);
+                    break;
+                }
+            }
         }
     }
 
+    // 市镇中心升级时代（复用 gamePhase1 的 updateStage：100帧节流 + Project==ACT_NULL + ins_ret 观测）
+    updateStage();
+
+    // 复合弓科技升级（靶场）：每 30 帧尝试一次，下发后用 ins_ret 判定是否成功（研究已开始），
+    // 成功则永久停止；失败或未收到回执则在下一个 30 帧窗口继续尝试
+    {
+        static int bowOrderId = -1;
+        static int bowOrderFrame = -10000;
+
+        if(!compositeBowDone && bowOrderId != -1) {
+            auto it = info.ins_ret.find(bowOrderId);
+            if(it != info.ins_ret.end()) {
+                DebugText("CompositeBow upgrade ins_ret code = " + to_string(it->second)
+                          + " frame = " + to_string(info.GameFrame));
+                if(it->second == ACTION_SUCCESS) compositeBowDone = true;
+                bowOrderId = -1;
+            }
+        }
+
+        if(!compositeBowDone && info.GameFrame - bowOrderFrame >= 30) {
+            bowOrderFrame = info.GameFrame;
+            for(auto& building : info.buildings) {
+                if(building.Type == BUILDING_RANGE && building.Project == ACT_NULL
+                    && info.Meat >= BUILDING_RANGE_UPGRADE_COMPOSITE_BOW_FOOD
+                    && info.Wood >= BUILDING_RANGE_UPGRADE_COMPOSITE_BOW_WOOD) {
+                    bowOrderId = BuildingAction(building.SN, BUILDING_RANGE_UPGRADE_COMPOSITE_BOW);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 保留的浆果/羚羊农民持续采集同类资源（浆果列表、羚羊尸体），直至全部枯竭才交回伐木
+    if(resourceSwitchDone) {
+        berryCollecting();                 // 只维护保留的浆果农民（采集所有开局可见浆果直至枯竭）
+        if(huntingPhase == 0) hunting(); else collecting();
+        bool liveGazelle = false;
+        for(auto& r : info.resources)
+            if(r.Type == RESOURCE_GAZELLE && r.Cnt > 0) { liveGazelle = true; break; }
+        // 羚羊/尸体 全部枯竭后释放猎人，交回伐木；浆果农民由 berryCollecting 自行逐步释放
+        if(!liveGazelle && deadMeatResources.empty() && huntingPhase == 0)
+            hunterFarmersSN.clear();
+    }
+
+    // ==== 统一分配（仅一次）====：farming 组从伐木工中抽取；repair/stone 组全部归入采金组
+    unifiedAssign();
+
+    // 新生成的村民交替分配：第偶数个去砍树，第奇数个去采金（未被任何工种标记且非 builder 的在册村民）
+    static int newFarmerIdx = 0;
+    for(auto& farmer : info.farmers) {
+        if(farmer.SN == builderSN) continue;
+        if(berryFarmersSN.count(farmer.SN) || hunterFarmersSN.count(farmer.SN)) continue;
+        if(stoneFarmersSN.count(farmer.SN) || repairFarmersSN.count(farmer.SN)
+           || goldFarmersSN.count(farmer.SN)) continue;
+        if(treeFarmersSN.count(farmer.SN) || currentFarmersSN.count(farmer.SN)) continue;  // 伐木/耕作组不得吸走
+        if(newFarmerIdx % 2 == 0) {
+            treeFarmersSN.insert(farmer.SN);   // 偶数序 → 伐木，logging() 会统一下发指令
+            DebugText("[assignDBG] new farmer " + to_string(farmer.SN) + " -> TREE #" + to_string(newFarmerIdx));
+        } else {
+            goldFarmersSN.insert(farmer.SN);   // 奇数序 → 挖金，goldMining() 会统一下发指令
+            DebugText("[assignDBG] new farmer " + to_string(farmer.SN) + " -> GOLD #" + to_string(newFarmerIdx));
+        }
+        newFarmerIdx++;
+    }
+
+    // 维修组动态借调：先保证箭塔安全
+    // 1) 敌人在视野范围内（enemy_armies 非空）：立即召回所有借调去挖金的维修工
+    //    （从 goldFarmersSN 删除），并对血量最低的受损箭塔直接下令修复；
+    // 2) 无敌人且无可修复箭塔（或石料不足）：空闲维修工临时借调去挖金
+    if(!repairFarmersSN.empty()) {
+        bool enemyInVision = !info.enemy_armies.empty();
+        // ==== 调试：repairFarmer 数据流追踪（每 50 帧输出一次，避免刷屏） ====
+        static int dbgRepairFrame = -10000;
+        if(info.GameFrame - dbgRepairFrame >= 50) {
+            dbgRepairFrame = info.GameFrame;
+            int borrowed = 0;
+            for(int sn : repairFarmersSN)
+                if(goldFarmersSN.count(sn)) borrowed++;
+            int damagedTowers = 0, minTowerBlood = INT_MAX;
+            for(auto& b : info.buildings)
+                if(b.Type == BUILDING_ARROWTOWER && b.Blood < b.MaxBlood) {
+                    damagedTowers++;
+                    minTowerBlood = min(minTowerBlood, b.Blood);
+                }
+            DebugText("[repairDBG] frame=" + to_string(info.GameFrame)
+                      + " repairSN=" + to_string(repairFarmersSN.size())
+                      + " borrowedGold=" + to_string(borrowed)
+                      + " enemy=" + to_string(info.enemy_armies.size())
+                      + " stone=" + to_string(info.Stone)
+                      + " damagedTower=" + to_string(damagedTowers)
+                      + " minBlood=" + (minTowerBlood == INT_MAX ? string("none") : to_string(minTowerBlood)));
+            // 逐人状态（SN/是否在采金组/当前状态），确认指令是否真的下达到人
+            for(auto& farmer : info.farmers) {
+                if(repairFarmersSN.count(farmer.SN) == 0) continue;
+                DebugText("[repairDBG] SN=" + to_string(farmer.SN)
+                          + " inGold=" + to_string(goldFarmersSN.count(farmer.SN) ? 1 : 0)
+                          + " state=" + to_string(farmer.NowState));
+            }
+        }
+        if(enemyInVision) {
+            // 找血量最低的受损箭塔，召回后直接下令修复
+            int targetSN = -1, minBlood = INT_MAX;
+            for(auto& b : info.buildings) {
+                if(b.Type == BUILDING_ARROWTOWER && b.Blood < b.MaxBlood && b.Blood < minBlood) {
+                    minBlood = b.Blood;
+                    targetSN = b.SN;
+                }
+            }
+            for(auto& farmer : info.farmers) {
+                if(repairFarmersSN.count(farmer.SN) == 0) continue;
+                if(goldFarmersSN.count(farmer.SN) == 0) continue;   // 未借调，无需召回
+                goldFarmersSN.erase(farmer.SN);                     // 从采金组召回
+                if(targetSN != -1 && info.Stone >= 50)
+                    HumanAction(farmer.SN, targetSN);               // 下令修复
+            }
+        } else {
+            bool towerDamaged = false;
+            for(auto& b : info.buildings) {
+                if(b.Type == BUILDING_ARROWTOWER && b.Blood < b.MaxBlood) { towerDamaged = true; break; }
+            }
+            if(!towerDamaged || info.Stone < 50) {
+                // 无可修目标：空闲维修工借调去挖金（goldMining() 会为其分配金矿）
+                for(auto& farmer : info.farmers) {
+                    if(repairFarmersSN.count(farmer.SN) && farmer.NowState == HUMAN_STATE_IDLE)
+                        goldFarmersSN.insert(farmer.SN);
+                }
+            }
+        }
+    }
+
+    // 房屋上限 10 个：达上限后不再新建
+    int homeCount = 0;
+    for(auto& b : info.buildings)
+        if(b.Type == BUILDING_HOME) homeCount++;
+    // 调试：人口/上限/已建房屋数 + 未建满时推入任务
+    static int dbgHomeFrame = -10000;
+    if(info.GameFrame - dbgHomeFrame >= 50) {
+        dbgHomeFrame = info.GameFrame;
+        DebugText("[homeDBG] frame=" + to_string(info.GameFrame)
+                  + " human=" + to_string(info.Human_Num) + "/" + to_string(info.Human_MaxNum)
+                  + " homes=" + to_string(homeCount)
+                  + " pending=" + to_string(buildTasks.size())
+                  + (homeCount >= 10 ? " CAP_REACHED" : ""));
+    }
+    if(info.Human_Num >= info.Human_MaxNum - 2 && homeCount < 10) {
+        // 去重：队列中已有待建房屋（含正在建造的）时不再推入，防止每帧重复 push
+        bool homePending = false;
+        for(auto& task : buildTasks)
+            if(task.Type == BUILDING_HOME) { homePending = true; break; }
+        if(!homePending) {
+            buildTasks.push_back({BUILDING_HOME, homeX, homeY, {}});
+            DebugText("[homeDBG] phase2 home pushed @(" + to_string(homeX) + "," + to_string(homeY)
+                      + ") homes=" + to_string(homeCount + 1)
+                      + " human=" + to_string(info.Human_Num) + "/" + to_string(info.Human_MaxNum)
+                      + " frame=" + to_string(info.GameFrame));
+        }
+    }
+
+    // 靶场优先生产复合弓兵（createArmy1）；食物不足以继续训练时才启动 farming 补食物
+    if(info.Meat < BUILDING_RANGE_CREATE_COMPOSITE_BOWMAN_FOOD) farming();
+    goldMining();     // 采金组（含原 repair/stone 组 + 新村民）
+    createArmy1();
     logging();
 }
 
 bool UsrAI::checkArmy1() {
-    return false;
+    const int chariotArcherNeed = 5;
+    int chariotArcherNum = 0;
+    for(auto& army: info.armies) {
+        if(army.Sort == AT_CHARIOT_ARCHER) {
+            chariotArcherNum++;
+        }
+    }
+    if(chariotArcherNum >= chariotArcherNeed) return false;
+    return true;
 }
 
-void UsrAI::gamePhase3() {
-    return;
+void UsrAI::gamePhase3() { // 全面反攻
+    static int lastOrderFrame = -1;
+    static pair<int,int> target = make_pair(-1,-1);
+    if(info.GameFrame - lastOrderFrame < 30) return;
+    lastOrderFrame = info.GameFrame;
+    //聚集到同一点
+    static bool gatherOrdered = false;
+    if(!gatherOrdered) {
+        target = legalPlaceAround(BUILDING_HOME, arrowTowerX, arrowTowerY);
+        for(auto& army : info.armies) {
+            if(army.NowState == HUMAN_STATE_WALKING) continue;
+            HumanMove(army.SN, target.first, target.second);
+        }
+        gatherOrdered = true;
+    }
+    //检测是否到达目标点
+    static bool allGathered = false;
+    if(!allGathered) {
+        for(auto& army : info.armies) {
+            if(army.NowState == HUMAN_STATE_IDLE) continue;
+            if(manhattan_distance(target.first, target.second, army.BlockDR, army.BlockUR) > 5) {
+                return;
+            }
+        }
+        allGathered = true;
+    }
+    //向大本营方向出发
+    static bool departed = false;
+    if(!departed) {
+        int enemyCenterX = 100 - centerX, enemyCenterY = 100 - centerY;
+        for(auto& army : info.armies) {
+            HumanMove(army.SN, enemyCenterX, enemyCenterY);
+        }
+        departed = true;
+    }
+
+    static bool lastEnemyFound = false;
+    bool enemyFound = info.enemy_armies.size() > 0;
+    if(enemyFound) {
+        lastEnemyFound = true;
+        int enemyArrowTowerSN = -1;
+
+        set<int> stoneThrowerSNs; int stoneThrowerTarget = -1;
+        set<int> chariotArcherSNs; int chariotArcherTarget = -1;
+        set<int> otherSNs; int otherTarget = -1;
+
+        for(auto& army : info.armies) {
+            if(army.Sort == AT_STONE_THROWER) {
+                stoneThrowerSNs.insert(army.SN);
+            } else if(army.Sort == AT_CHARIOT_ARCHER) {
+                chariotArcherSNs.insert(army.SN);
+            } else {
+                otherSNs.insert(army.SN);
+            }
+        }
+
+        for(auto& building : info.enemy_buildings) {
+            if(building.Type == BUILDING_ARROWTOWER) {
+                enemyArrowTowerSN = building.SN;
+                break;
+            }
+        }
+
+        if(enemyArrowTowerSN != -1) { // 敌方箭塔存在
+            stoneThrowerTarget = enemyArrowTowerSN;
+            otherTarget = enemyArrowTowerSN;
+            for(auto& army : info.enemy_armies) {
+                if(stoneThrowerSNs.find(army.WorkObjectSN) != stoneThrowerSNs.end()) {
+                    chariotArcherTarget = army.SN;
+                    break;
+                }
+            }
+        } else { // 敌方箭塔不存在：终局目标——祭司贴邻转化敌方攻城武器厂（isWin 判胜）
+            // 1.定位敌方攻城武器厂：必须已建成(Percent>=100)才能转化，且全程不可被误伤摧毁
+            int enemySiegeSN = -1;
+            for(auto& building : info.enemy_buildings) {
+                if(building.Type == BUILDING_SIEGE && building.Blood > 0 && building.Percent >= 100) {
+                    enemySiegeSN = building.SN;
+                    break;
+                }
+            }
+
+            // 2.守军威胁排序：正在攻击祭司的敌人 > 敌方投石车(10格AOE对我方集群致命) > 其他守军
+            int priestAttackerSN = -1, enemyThrowerSN = -1, anyEnemySN = -1;
+            for(auto& enemy : info.enemy_armies) {
+                if(enemy.Blood <= 0) continue;
+                if(priestAttackerSN == -1 && enemy.WorkObjectSN == priestSN) priestAttackerSN = enemy.SN;
+                if(enemyThrowerSN == -1 && enemy.Sort == AT_STONE_THROWER) enemyThrowerSN = enemy.SN;
+                if(anyEnemySN == -1) anyEnemySN = enemy.SN;
+            }
+            int guardTarget = (priestAttackerSN != -1) ? priestAttackerSN
+                           : (enemyThrowerSN != -1 ? enemyThrowerSN : anyEnemySN);
+
+            // 3.祭司走向攻城武器厂转化；仅在空闲时下令，避免打断已进行的 2-6 秒转化读条
+            if(enemySiegeSN != -1 && priestSN != -1) {
+                for(auto& army : info.armies) {
+                    if(army.SN == priestSN && army.NowState == HUMAN_STATE_IDLE) {
+                        HumanAction(priestSN, enemySiegeSN);
+                        break;
+                    }
+                }
+            }
+
+            // 4.我方投石车：只与敌方投石车对射；严禁攻击建筑(AOE溅射会误伤待转化的攻城厂)，无敌方投石车则待命
+            stoneThrowerTarget = enemyThrowerSN;
+
+            // 5.战车弓兵+近战(方阵/阔剑)：优先清剿威胁祭司的敌人，其次近身强拆敌方投石车(其有最小射程盲区)，最后其他守军
+            chariotArcherTarget = guardTarget;
+            otherTarget = guardTarget;
+        }
+
+        if(stoneThrowerTarget != -1)
+            for(auto& armySN : stoneThrowerSNs)  HumanAction(armySN, stoneThrowerTarget);
+        if(chariotArcherTarget != -1)
+            for(auto& armySN : chariotArcherSNs) HumanAction(armySN, chariotArcherTarget);
+        if(otherTarget != -1)
+            for(auto& armySN : otherSNs)         HumanAction(armySN, otherTarget);
+        
+    } else if(lastEnemyFound) {
+        departed = false;
+        lastEnemyFound = false;
+    }
+    
 }
 
 void UsrAI::assignFarmer()
@@ -1430,6 +2028,40 @@ void UsrAI::berryCollecting() {
         if(available.count(sn) == 0) assignedBerrySNs.erase(sn);
     }
 
+    // 既有浆果农民维护：中断后安全网重发；自己的浆果采完后改派其它开局可见浆果，
+    // 所有浆果枯竭后才释放交回 logging 收编（需求1：持续采集所有开局可见浆果）
+    for(auto& farmer : info.farmers) {
+        if(berryFarmersSN.count(farmer.SN) == 0) continue;
+        if(farmer.NowState != HUMAN_STATE_IDLE) continue;
+        auto it = berryAssignment.find(farmer.SN);
+        int curSN = (it == berryAssignment.end()) ? -1 : it->second;
+        // 当前浆果仍可采：安全网重发采集指令
+        if(curSN != -1 && available.count(curSN)) {
+            HumanAction(farmer.SN, curSN);
+            continue;
+        }
+        if(curSN != -1) {
+            assignedBerrySNs.erase(curSN);
+            berryAssignment.erase(it);
+        }
+        // 改派到其它未占用的开局可见浆果
+        int berrySN = -1;
+        for(int sn : berryResourceSNs) {
+            if(available.count(sn) && assignedBerrySNs.count(sn) == 0) { berrySN = sn; break; }
+        }
+        if(berrySN != -1) {
+            assignedBerrySNs.insert(berrySN);
+            berryAssignment[farmer.SN] = berrySN;
+            HumanAction(farmer.SN, berrySN);
+        } else {
+            // 所有浆果全部枯竭，释放该农民，交回 logging 收编
+            berryFarmersSN.erase(farmer.SN);
+        }
+    }
+
+    // 切换完成后不再新增浆果采集者（保留的农民持续采集至全部枯竭）
+    if(resourceSwitchDone) return;
+
     for(auto& farmer : info.farmers) {
         if(farmer.SN == builderSN) continue;
         if(hunterFarmersSN.count(farmer.SN) || berryFarmersSN.count(farmer.SN)
@@ -1439,7 +2071,11 @@ void UsrAI::berryCollecting() {
         for(int sn : berryResourceSNs) {
             if(available.count(sn) && assignedBerrySNs.count(sn) == 0) { berrySN = sn; break; }
         }
-        if(berrySN == -1) break;  // 浆果不够，等待回收
+        if(berrySN == -1) {
+            // 所有浆果都已有村民采集，新村民加入打猎
+            hunterFarmersSN.insert(farmer.SN);
+            continue;
+        }
 
         assignedBerrySNs.insert(berrySN);
         berryAssignment[farmer.SN] = berrySN;
@@ -1483,36 +2119,92 @@ void UsrAI::stoneMining() {
     flag = true;
 }
 
-// 需求4：食物总量>=800 且 人口>=16 时，浆果采集者转采石、猎人转伐木
+// 需求4：食物总量>=900 且 人口>=16 时，浆果农民前3人转采石，其余对半分(一半继续采浆果 / 一半转采羚羊)，原猎人交回伐木
 void UsrAI::resourceSwitch() {
     if(resourceSwitchDone) return;
-    if(info.Meat < 800 || info.Human_Num < 16) return;
+    if(info.Meat < 900 || info.Human_Num < 16) return;
     resourceSwitchDone = true;
 
-    // 浆果采集村民 → 采石
-    for(int sn : berryFarmersSN) {
-        stoneFarmersSN.insert(sn);
-    }
-    berryFarmersSN.clear();
-    berryAssignment.clear();
-
-    // 猎人 → 伐木：清空猎人标记，交回 logging() 统一认领（meat>=800 分支会调用 logging）
+    // 原猎人 → 伐木：清空猎人标记，交回 logging() 统一认领（meat>=900 分支会调用 logging）
     hunterFarmersSN.clear();
+
+    // 浆果农民改造:前3人转采石，其余按序交替分配——一半继续采浆果，一半转入猎人继续采羚羊
+    vector<int> berryList(berryFarmersSN.begin(), berryFarmersSN.end());   // 提前拷贝，避免遍历中修改集合
+    const int STONE_PICK_NUM = 3;                                          // 转采石的浆果农民数量
+    for(int idx = 0; idx < (int)berryList.size(); idx++) {
+        int sn = berryList[idx];
+        if(idx < STONE_PICK_NUM) {
+            // 前3人转采石
+            stoneFarmersSN.insert(sn);
+            berryFarmersSN.erase(sn);
+            berryAssignment.erase(sn);
+        } else if((idx - STONE_PICK_NUM) % 2 == 0) {
+            // 一半继续采浆果：保留在 berryFarmersSN，既有 berryAssignment 继续生效
+        } else {
+            // 一半转采羚羊：移入猎人集合，由 hunting()/collecting() 统一管理
+            hunterFarmersSN.insert(sn);
+            berryFarmersSN.erase(sn);
+            berryAssignment.erase(sn);
+        }
+    }
+    // 修理箭塔逻辑在 repairRepurpose()/fixingArrowTower() 中保持不变
+
+    // resourceSwitch 后优先安排木材加工升级（研发:远程攻击距离+1,伐木+2；120食物/75木头）
+    woodUpgradePending = true;
 }
 
-// 需求5：14000帧（第二波敌人进攻阶段）采石村民二次分配：4人继续采石，其余转箭塔维修
+// 木材加工升级（市场）：resourceSwitch 后优先下发；30 帧节流 + 市场空闲 + ins_ret 判定成功
+void UsrAI::woodUpgrade() {
+    static int woodOrderId = -1;
+    static int woodOrderFrame = -10000;
+
+    if(!woodUpgradePending) return;
+
+    // 上一条指令结果（ins_ret 仅下一帧有效），读到即复位
+    if(woodOrderId != -1) {
+        auto it = info.ins_ret.find(woodOrderId);
+        if(it != info.ins_ret.end()) {
+            DebugText("[woodDBG] Wood upgrade ins_ret code = " + to_string(it->second)
+                      + " frame = " + to_string(info.GameFrame));
+            if(it->second == ACTION_SUCCESS) {
+                woodUpgradePending = false;   // 研究已开始，永久停止
+                return;
+            }
+            woodOrderId = -1;   // 失败：下一窗口重试
+        }
+    }
+
+    if(info.GameFrame - woodOrderFrame < 30) return;
+    woodOrderFrame = info.GameFrame;
+
+    for(auto& building : info.buildings) {
+        if(building.Type == BUILDING_MARKET && building.Project == ACT_NULL
+            && info.Meat >= BUILDING_MARKET_WOOD_UPGRADE_FOOD
+            && info.Wood >= BUILDING_MARKET_WOOD_UPGRADE_WOOD) {
+            woodOrderId = BuildingAction(building.SN, BUILDING_MARKET_WOOD_UPGRADE);
+            DebugText("[woodDBG] Wood upgrade ordered, frame = " + to_string(info.GameFrame));
+            break;
+        }
+    }
+}
+
+// 需求5：14000帧（第二波敌人进攻阶段）采石村民二次分配：1人继续采石，其余转箭塔维修
 void UsrAI::repairRepurpose() {
     if(repairRepurposeDone) return;
-    if(info.GameFrame < 14000) return;
+    if(info.GameFrame < 13500) return;
     repairRepurposeDone = true;
 
-    // 从采石村民中选前4人继续采石，其余转维修
+    // 从采石村民中选前1人继续采石，其余转维修
     vector<int> stoneList(stoneFarmersSN.begin(), stoneFarmersSN.end());
-    const int keepStoneNum = 4;
+    const int keepStoneNum = 1;
     for(int i = keepStoneNum; i < (int)stoneList.size(); i++) {
         stoneFarmersSN.erase(stoneList[i]);
         repairFarmersSN.insert(stoneList[i]);
     }
+    // 调试：二次分配结果
+    string snList;
+    for(int sn : repairFarmersSN) snList += to_string(sn) + " ";
+    DebugText("[repairDBG] repairRepurpose @13500: repairFarmers={" + snList + "}");
 }
 
 void UsrAI::processData()
@@ -1524,9 +2216,11 @@ void UsrAI::processData()
     assignArmy();
     priest();
 
-    // 需求4：资源动态切换（食物>=800 && 人口>=16 → 浆果转采石 / 猎人转伐木）
+    // 需求4：资源动态切换（食物>=900 && 人口>=16 → 前3名浆果农民转采石，其余继续采浆果/羚羊，原猎人转伐木）
     resourceSwitch();
-    // 需求5：14000帧采石村民二次分配（4人采石 / 其余修塔）
+    // resourceSwitch 后优先安排木材加工升级（远程攻击距离+1,伐木+2）
+    woodUpgrade();
+    // 需求5：13500帧采石村民二次分配（1人采石 / 其余修塔）
     repairRepurpose();
 
     // 优先修箭塔：builder 始终 + 二次分配来的维修组，血量最低塔优先
