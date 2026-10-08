@@ -74,6 +74,8 @@ private:
     void priest();
     void logging();
     void farming();
+    void farmingIdlePoll();   // 每1s轮询耕作村民，空闲则重新下发种地 HumanAction
+    void fixUnstaffedFoundations();   // 看护无人修建的未完工地基（防止99%地基永久搁置）
     void goldMining();
     void berryCollecting();
     void stoneMining();
@@ -87,6 +89,7 @@ private:
     void gamePhase3();
     void unifiedAssign();
     void woodUpgrade();
+    void pairFirstHunters();
 };
 
 #endif

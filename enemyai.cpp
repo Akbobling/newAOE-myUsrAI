@@ -1,4 +1,4 @@
-﻿#include "enemyai.h"
+#include "enemyai.h"
 #include "MainWidget.h"
 #include "Human.h"
 #include <iostream>
@@ -44,10 +44,10 @@ tagInfo enemyInfo;
 #define SAT 13500    //第二波骚扰时间
 #define TAT 21000    //第三波骚扰时间
 #define radius_Inner 20
-#define DEFENSE_ALERT_RANGE 20
+#define DEFENSE_ALERT_RANGE 15    // 玩家军队/村民进入攻城武器厂15格内 → 守军主动迎击
 #define DEFENSE_CLOSE_ALERT_RANGE 6
 #define DEFENSE_ASSIST_RADIUS 8
-#define DEFENSE_CHASE_LIMIT 25
+#define DEFENSE_CHASE_LIMIT 18    // 守军追击至距核心区域超过18格即终止追击返回原防守位
 #define PRIEST_GUARD_RANGE 20
 
 static int vision[128][128];
@@ -2116,7 +2116,7 @@ void EnemyAI::AssignDefense()
             }
         }
 
-        // 近战守军最多追到核心外约 25 格；远程守军再扣除自身射程。
+        // 近战守军最多追到核心外约 18 格；远程守军再扣除自身射程。
         const int chaseLimit = DefenseChaseLimitBlocks(*army);
         auto defenseHome = DefenseHome.find(sn);
         const bool hasLeftDefenseHome =
